@@ -1,0 +1,52 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#4f46e5'}}}%%
+flowchart TB
+    subgraph ControlPlane["Control Plane (Data Owner)"]
+        API[Control Plane API]
+        UI[Dashboard UI]
+        ArtifactAPI[Artifact API]
+        EvidenceAPI[Evidence API]
+        PG[(PostgreSQL)]
+    end
+
+    subgraph ExecutionPlane["Execution Plane"]
+        OW[Orchestrator Worker]
+        Runner[Runner]
+        MCP[MCP Tools]
+    end
+
+    subgraph Infrastructure["Infrastructure"]
+        Temporal[Temporal]
+        Redis[(Redis)]
+        Qdrant[(Qdrant)]
+    end
+
+    subgraph ModelRuntime["Model Runtime (Optional)"]
+        Ollama[Ollama]
+        VLLM[vLLM]
+        Cloud[Cloud API]
+    end
+
+    UI --> API
+    API --> Temporal
+    API --> PG
+    ArtifactAPI --> PG
+    EvidenceAPI --> PG
+
+    Temporal --> OW
+    OW --> Runner
+    OW --> MCP
+
+    %% Execution plane writes via Control Plane APIs
+    OW -->|POST /artifacts| ArtifactAPI
+    OW -->|POST /evidence| EvidenceAPI
+
+    %% MCP tools for search
+    MCP --> Qdrant
+
+    %% AI-assisted tools may use model runtime
+    MCP -.->|AI tools only| Ollama
+    MCP -.->|AI tools only| VLLM
+    MCP -.->|AI tools only| Cloud
+
+    %% Ephemeral state
+    OW --> Redis

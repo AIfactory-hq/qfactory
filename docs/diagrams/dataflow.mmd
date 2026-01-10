@@ -1,0 +1,53 @@
+%%{init: {'theme': 'base'}}%%
+flowchart LR
+    subgraph Input
+        Req[Requirement]
+        Code[Existing Code]
+    end
+
+    subgraph ExecutionPlane["Execution Plane"]
+        Analyze[Analyze]
+        Generate[Generate]
+        Test[Test]
+        Verify[Verify]
+    end
+
+    subgraph ControlPlane["Control Plane APIs"]
+        ArtifactAPI[Artifact API]
+        EvidenceAPI[Evidence API]
+    end
+
+    subgraph Output
+        Diff[Code Diff]
+        Tests[Test Suite]
+        Evidence[Evidence Bundle]
+    end
+
+    subgraph Storage["Control Plane Storage"]
+        PG[(PostgreSQL)]
+        Qdrant[(Qdrant)]
+        Temporal[(Temporal)]
+    end
+
+    Req --> Analyze
+    Code --> Qdrant
+    Qdrant --> |Semantic Search| Analyze
+
+    Analyze --> |Plan| Generate
+    Generate --> |Diff| Test
+    Test --> |Results| Verify
+
+    Verify --> Diff
+    Verify --> Tests
+    Verify --> Evidence
+
+    %% All writes go through Control Plane APIs
+    Diff --> ArtifactAPI
+    Tests --> ArtifactAPI
+    Evidence --> EvidenceAPI
+
+    ArtifactAPI --> PG
+    EvidenceAPI --> PG
+
+    Generate --> |State| Temporal
+    Test --> |State| Temporal

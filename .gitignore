@@ -1,0 +1,69 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker-compose.override.yml
+
+# Node (for UI)
+apps/ui/node_modules/
+apps/ui/.next/
+apps/ui/out/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Model weights (large files)
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# Evidence bundles (generated)
+evidence/
+
+# Local secrets
+secrets/
+*.pem
+*.key

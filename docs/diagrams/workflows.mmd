@@ -1,0 +1,61 @@
+%%{init: {'theme': 'base'}}%%
+stateDiagram-v2
+    [*] --> Submitted: Submit Request
+
+    Submitted --> Analyzing: Start Workflow
+
+    Analyzing --> Planning: Requirement Valid
+    Analyzing --> Failed: Invalid Requirement
+
+    Planning --> Generating: Plan Approved
+
+    Generating --> PR0: Code Generated
+
+    state PR0 {
+        [*] --> Compiling
+        Compiling --> Formatting: Pass
+        Formatting --> Linting: Pass
+        Linting --> [*]: Pass
+        Compiling --> GateFailed: Fail
+        Formatting --> GateFailed: Fail
+        Linting --> GateFailed: Fail
+    }
+
+    PR0 --> TestGen: PR0 Pass
+    PR0 --> Regenerating: PR0 Fail
+
+    Regenerating --> Generating: Retry < Max
+    Regenerating --> Failed: Retry >= Max
+
+    TestGen --> PR1: Tests Generated
+
+    state PR1 {
+        [*] --> RunningTests
+        RunningTests --> CheckingCoverage: Pass
+        CheckingCoverage --> ValidatingContracts: Pass
+        ValidatingContracts --> [*]: Pass
+    }
+
+    PR1 --> PR2: PR1 Pass
+    PR1 --> Fixing: PR1 Fail
+
+    Fixing --> TestGen: Fixed
+
+    state PR2 {
+        [*] --> IntegrationTests
+        IntegrationTests --> SecurityScan: Pass
+        SecurityScan --> PerfBaseline: Pass
+        PerfBaseline --> [*]: Pass
+    }
+
+    PR2 --> EvidenceBundle: PR2 Pass
+
+    EvidenceBundle --> Completed: Bundle Created
+
+    Completed --> [*]
+    Failed --> [*]
+
+    note right of PR2
+        PR3 (System Validation)
+        planned for future phases
+    end note

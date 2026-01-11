@@ -39,15 +39,48 @@ qfactory/
 Prerequisites: Docker, Docker Compose, Go 1.22+
 
 ```bash
-# Start infrastructure (Postgres, Redis, Qdrant, Temporal)
+# 1. Start infrastructure (Postgres, Redis, Qdrant, Temporal)
 ./scripts/dev-up.sh
 
-# Verify all services are healthy
+# 2. Verify all services are healthy
 ./scripts/check.sh
 
-# Stop infrastructure
+# 3. In terminal 1: Start the control-plane API
+./scripts/run-api.sh
+
+# 4. In terminal 2: Start the orchestrator worker
+./scripts/run-worker.sh
+
+# 5. Create a workflow run
+curl -X POST http://localhost:8090/workflows \
+  -H "Content-Type: application/json" \
+  -d '{"type":"demo","requirement":"test run"}'
+
+# 6. Watch events via SSE (replace RUN_ID with id from step 5)
+curl -N http://localhost:8090/runs/RUN_ID/events
+
+# 7. Check run status
+curl http://localhost:8090/runs/RUN_ID
+
+# Stop infrastructure when done
 ./scripts/dev-down.sh
 ```
+
+### Service URLs
+
+| Service | URL |
+|---------|-----|
+| Control Plane API | http://localhost:8090 |
+| Temporal UI | http://localhost:8088 |
+| Qdrant Dashboard | http://localhost:6333/dashboard |
+
+### API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | /workflows | Create and start a new workflow run |
+| GET | /runs/{id} | Get workflow run status |
+| GET | /runs/{id}/events | SSE stream of run events |
 
 ## PR Levels (Quality Gates)
 

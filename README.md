@@ -74,6 +74,7 @@ curl http://localhost:8090/runs/RUN_ID
 | Service | URL |
 |---------|-----|
 | Control Plane API | http://localhost:8090 |
+| Gate Runner | http://localhost:8095 |
 | qfactory Dashboard | http://localhost:3000 |
 | Temporal UI | http://localhost:8088 |
 | Qdrant Dashboard | http://localhost:6333/dashboard |
@@ -89,6 +90,38 @@ curl http://localhost:8090/runs/RUN_ID
 | POST | /runs/{id}/gates/pr1 | Execute PR1 (unit test) gate |
 | GET | /runs/{id}/evidence | Get evidence manifest |
 | GET | /runs/{id}/evidence.zip | Download evidence bundle |
+
+### Gate Execution (v0.7)
+
+Gates can be executed locally or remotely via the gate-runner service.
+
+**Local execution** (default):
+```bash
+curl -X POST http://localhost:8090/runs/{id}/gates/PR1/unit_tests/run
+```
+
+**Remote execution** via gate-runner:
+```bash
+# Terminal 4: Start the gate runner
+./scripts/run-gate-runner.sh
+
+# Execute gate remotely
+curl -X POST http://localhost:8090/runs/{id}/gates/PR1/unit_tests/run \
+  -H "Content-Type: application/json" \
+  -d '{"executor": "remote", "runner_url": "http://localhost:8095"}'
+```
+
+**Gate Runner Environment Variables:**
+- `GATE_RUNNER_ADDR`: Listen address (default: `:8095`)
+- `GATE_RUNNER_NAME`: Runner name for executor identification (default: `local`)
+- `GATE_RUNNER_REPO_ROOT`: Repository root directory for command execution
+
+**Supported Gates:**
+| Level | Name | Command |
+|-------|------|---------|
+| PR1 | unit_tests | `go test ./... -count=1` |
+| PR2 | integration_smoke | `go test ./... -run TestIntegration -count=1 -v` |
+| PR3 | security_scan | `gosec ./... && govulncheck ./... && staticcheck ./...` |
 
 ### PR1 Gate (v0.2)
 

@@ -98,6 +98,17 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		return fmt.Errorf("failed to execute migration 004: %w", err)
 	}
 
+	// Run migration 005
+	migration005SQL, err := os.ReadFile("infra/migrations/005_finalize_capsule.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read migration 005: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, string(migration005SQL))
+	if err != nil {
+		return fmt.Errorf("failed to execute migration 005: %w", err)
+	}
+
 	log.Println("Database migrations applied successfully")
 	return nil
 }
@@ -173,15 +184,20 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*contracts.Workf
 	query := `
 		SELECT id, temporal_id, status, current_stage, created_at, updated_at,
 		       completed_at, error, stages_json, gates_json, budget_policy_json,
-		       gate_policy_json, budget_status_json, model_calls_json
+		       gate_policy_json, budget_status_json, model_calls_json,
+		       finalized_at, finalized_by, finalize_reason, finalize_override,
+		       finalize_override_reason, capsule_id, capsule_path, capsule_manifest_sha256
 		FROM runs WHERE id = $1
 	`
 
 	run := &contracts.WorkflowRun{}
 	var temporalID, currentStage, errorStr sql.NullString
-	var completedAt sql.NullTime
+	var completedAt, finalizedAt sql.NullTime
 	var stagesJSON, gatesJSON, modelCallsJSON []byte
 	var budgetPolicyJSON, gatePolicyJSON, budgetStatusJSON sql.NullString
+	var finalizedBy, finalizeReason, finalizeOverrideReason sql.NullString
+	var finalizeOverride sql.NullBool
+	var capsuleID, capsulePath, capsuleManifestSHA256 sql.NullString
 
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
 		&run.ID,
@@ -198,6 +214,14 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*contracts.Workf
 		&gatePolicyJSON,
 		&budgetStatusJSON,
 		&modelCallsJSON,
+		&finalizedAt,
+		&finalizedBy,
+		&finalizeReason,
+		&finalizeOverride,
+		&finalizeOverrideReason,
+		&capsuleID,
+		&capsulePath,
+		&capsuleManifestSHA256,
 	)
 	if err == sql.ErrNoRows {
 		return nil, false, nil
@@ -212,6 +236,18 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*contracts.Workf
 	if completedAt.Valid {
 		run.CompletedAt = &completedAt.Time
 	}
+	if finalizedAt.Valid {
+		run.FinalizedAt = &finalizedAt.Time
+	}
+	run.FinalizedBy = finalizedBy.String
+	run.FinalizeReason = finalizeReason.String
+	if finalizeOverride.Valid {
+		run.FinalizeOverride = finalizeOverride.Bool
+	}
+	run.FinalizeOverrideReason = finalizeOverrideReason.String
+	run.CapsuleID = capsuleID.String
+	run.CapsulePath = capsulePath.String
+	run.CapsuleManifestSHA256 = capsuleManifestSHA256.String
 
 	if err := json.Unmarshal(stagesJSON, &run.Stages); err != nil {
 		return nil, false, fmt.Errorf("failed to unmarshal stages: %w", err)
@@ -791,6 +827,93 @@ func (s *PostgresStore) GetGatePolicy(ctx context.Context, runID string) (*contr
 	}
 
 	return &policy, nil
+}
+
+// FinalizeRun marks a run as finalized with capsule metadata.
+func (s *PostgresStore) FinalizeRun(ctx context.Context, runID string, params FinalizeParams) error {
+	// First check current state
+	run, found, err := s.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("run not found: %s", runID)
+	}
+
+	// Check if already finalized (idempotent)
+	if run.IsFinalized() {
+		// Already finalized - return success for idempotency
+		return nil
+	}
+
+	// Check if run is completed
+	if run.Status != contracts.RunStatusCompleted {
+		return fmt.Errorf("run must be completed to finalize (current status: %s)", run.Status)
+	}
+
+	query := `
+		UPDATE runs SET
+			status = $2,
+			finalized_at = $3,
+			finalized_by = $4,
+			finalize_reason = $5,
+			finalize_override = $6,
+			finalize_override_reason = $7,
+			capsule_id = $8,
+			capsule_path = $9,
+			capsule_manifest_sha256 = $10,
+			updated_at = $11
+		WHERE id = $1 AND status = 'completed'
+	`
+
+	result, err := s.db.ExecContext(ctx, query,
+		runID,
+		string(contracts.RunStatusFinalized),
+		params.FinalizedAt,
+		nullString(params.FinalizedBy),
+		nullString(params.FinalizeReason),
+		params.FinalizeOverride,
+		nullString(params.FinalizeOverrideReason),
+		nullString(params.CapsuleID),
+		nullString(params.CapsulePath),
+		nullString(params.CapsuleManifestSHA256),
+		time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to finalize run: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		// Re-check state - might have been finalized by another request
+		run, _, err = s.GetRun(ctx, runID)
+		if err != nil {
+			return err
+		}
+		if run.IsFinalized() {
+			return nil // Idempotent success
+		}
+		return fmt.Errorf("run is no longer in completed state")
+	}
+
+	return nil
+}
+
+// IsRunFinalized checks if a run is finalized.
+func (s *PostgresStore) IsRunFinalized(ctx context.Context, runID string) (bool, error) {
+	query := `SELECT status, finalized_at FROM runs WHERE id = $1`
+
+	var status string
+	var finalizedAt sql.NullTime
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(&status, &finalizedAt)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	return status == string(contracts.RunStatusFinalized) || finalizedAt.Valid, nil
 }
 
 // Helper functions for nullable types

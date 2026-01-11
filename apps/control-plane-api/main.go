@@ -24,6 +24,7 @@ import (
 	"go.temporal.io/sdk/client"
 
 	"github.com/AIfactory-hq/qfactory/apps/orchestrator-worker/workflow"
+	"github.com/AIfactory-hq/qfactory/internal/capsules"
 	"github.com/AIfactory-hq/qfactory/internal/gates"
 	"github.com/AIfactory-hq/qfactory/internal/modelruntime"
 	"github.com/AIfactory-hq/qfactory/internal/store"
@@ -103,15 +104,26 @@ func main() {
 
 	gateRunner := gates.NewGateRunner(pgStore, contracts.EvidenceDir)
 
+	// Initialize capsule signer (v0.9)
+	capsuleSigner, err := capsules.NewSigner()
+	if err != nil {
+		log.Fatalf("Failed to initialize capsule signer: %v", err)
+	}
+	log.Printf("Capsule signer initialized (fingerprint: %s)", capsuleSigner.PublicKeyFingerprint()[:16]+"...")
+
+	capsuleExporter := capsules.NewExporter(capsuleSigner, contracts.EvidenceDir)
+
 	server := &Server{
-		store:        pgStore,
-		sseHub:       sseHub,
-		temporal:     tc,
-		evidenceSvc:  evidenceSvc,
-		searchSvc:    searchSvc,
-		modelRuntime: modelRT,
-		budgetMgr:    budgetMgr,
-		gateRunner:   gateRunner,
+		store:           pgStore,
+		sseHub:          sseHub,
+		temporal:        tc,
+		evidenceSvc:     evidenceSvc,
+		searchSvc:       searchSvc,
+		modelRuntime:    modelRT,
+		budgetMgr:       budgetMgr,
+		gateRunner:      gateRunner,
+		capsuleSigner:   capsuleSigner,
+		capsuleExporter: capsuleExporter,
 	}
 
 	// Wire up gate runner with event publisher
@@ -153,6 +165,12 @@ func main() {
 	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/diff", server.handleGateDiff)
 	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/latest", server.handleGetLatestGate)
 
+	// Finalization and capsule endpoints (v0.9)
+	mux.HandleFunc("POST /runs/{id}/finalize", server.handleFinalizeRun)
+	mux.HandleFunc("GET /runs/{id}/capsule", server.handleGetCapsule)
+	mux.HandleFunc("GET /runs/{id}/capsule.zip", server.handleGetCapsuleZip)
+	mux.HandleFunc("POST /capsules/verify", server.handleVerifyCapsule)
+
 	addr := ":8090"
 	log.Printf("Control-plane API listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
@@ -162,14 +180,16 @@ func main() {
 
 // Server holds dependencies for HTTP handlers.
 type Server struct {
-	store        store.Store
-	sseHub       *store.SSEHub
-	temporal     client.Client
-	evidenceSvc  *EvidenceService
-	searchSvc    *SearchService
-	modelRuntime modelruntime.Runtime
-	budgetMgr    *modelruntime.BudgetManager
-	gateRunner   *gates.GateRunner
+	store          store.Store
+	sseHub         *store.SSEHub
+	temporal       client.Client
+	evidenceSvc    *EvidenceService
+	searchSvc      *SearchService
+	modelRuntime   modelruntime.Runtime
+	budgetMgr      *modelruntime.BudgetManager
+	gateRunner     *gates.GateRunner
+	capsuleSigner  *capsules.Signer   // v0.9
+	capsuleExporter *capsules.Exporter // v0.9
 }
 
 // writeJSON writes a JSON response with the given status code.
@@ -182,6 +202,16 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 // writeJSONError writes a JSON error response.
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// checkNotFinalized returns true if the handler should abort (run is finalized).
+// Writes 409 Conflict if the run is finalized.
+func checkNotFinalized(w http.ResponseWriter, run *contracts.WorkflowRun) bool {
+	if run.IsFinalized() {
+		writeJSONError(w, http.StatusConflict, "run is finalized and cannot be modified")
+		return true
+	}
+	return false
 }
 
 // PublishEvent implements gates.EventPublisher interface.
@@ -378,6 +408,16 @@ func (s *Server) handleInternalEvent(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	// Check if run is finalized (v0.9)
+	finalized, err := s.store.IsRunFinalized(ctx, event.RunID)
+	if err != nil {
+		log.Printf("Warning: failed to check if run is finalized: %v", err)
+	}
+	if finalized {
+		writeJSONError(w, http.StatusConflict, "run is finalized and cannot be modified")
+		return
+	}
+
 	// Persist event and update run state in DB
 	if err := s.store.AddEvent(ctx, event); err != nil {
 		log.Printf("Warning: failed to persist event: %v", err)
@@ -407,6 +447,11 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if finalized (v0.9)
+	if checkNotFinalized(w, run) {
 		return
 	}
 
@@ -547,6 +592,11 @@ func (s *Server) handlePR2Gate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject if finalized (v0.9)
+	if checkNotFinalized(w, run) {
+		return
+	}
+
 	// Reject if run is not completed (PR0/PR1 must have finished)
 	if run.Status != contracts.RunStatusCompleted {
 		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to run PR2 gate (current status: %s)", run.Status))
@@ -605,6 +655,11 @@ func (s *Server) handlePR3Gate(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if finalized (v0.9)
+	if checkNotFinalized(w, run) {
 		return
 	}
 
@@ -1381,6 +1436,11 @@ func (s *Server) handleModelComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject if finalized (v0.9)
+	if checkNotFinalized(w, run) {
+		return
+	}
+
 	var req ModelCompleteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -1507,6 +1567,11 @@ func (s *Server) handlePatchBudget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject if finalized (v0.9)
+	if checkNotFinalized(w, run) {
+		return
+	}
+
 	var policy contracts.BudgetPolicy
 	if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body")
@@ -1574,6 +1639,11 @@ func (s *Server) handleRunGate(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if finalized (v0.9)
+	if checkNotFinalized(w, run) {
 		return
 	}
 
@@ -1676,13 +1746,18 @@ func (s *Server) handlePatchGatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	_, ok, err := s.store.GetRun(ctx, id)
+	run, ok, err := s.store.GetRun(ctx, id)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
 		return
 	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if finalized (v0.9)
+	if checkNotFinalized(w, run) {
 		return
 	}
 
@@ -1699,7 +1774,7 @@ func (s *Server) handlePatchGatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Return updated run
-	run, _, _ := s.store.GetRun(ctx, id)
+	run, _, _ = s.store.GetRun(ctx, id)
 	writeJSON(w, http.StatusOK, run)
 }
 
@@ -1803,6 +1878,11 @@ func (s *Server) handleRetryGate(w http.ResponseWriter, r *http.Request) {
 	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if finalized (v0.9)
+	if checkNotFinalized(w, run) {
 		return
 	}
 
@@ -2152,4 +2232,311 @@ func (s *Server) handleGetLatestGate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleFinalizeRun handles POST /runs/{id}/finalize (v0.9)
+func (s *Server) handleFinalizeRun(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Check if already finalized (idempotent)
+	if run.IsFinalized() {
+		writeJSON(w, http.StatusOK, contracts.FinalizeResponse{
+			RunID:              run.ID,
+			Finalized:          true,
+			CapsuleID:          run.CapsuleID,
+			CapsulePath:        run.CapsulePath,
+			ManifestSHA256:     run.CapsuleManifestSHA256,
+			FinalizedAt:        run.FinalizedAt,
+			FinalizedBy:        run.FinalizedBy,
+			Override:           run.FinalizeOverride,
+			OverrideReason:     run.FinalizeOverrideReason,
+		})
+		return
+	}
+
+	// Must be completed to finalize
+	if run.Status != contracts.RunStatusCompleted {
+		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to finalize (current status: %s)", run.Status))
+		return
+	}
+
+	// Parse request body
+	var req contracts.FinalizeRequest
+	if r.Body != nil && r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+
+	// Get gate history for trust calculation
+	history, _ := s.store.ListGateHistory(ctx, id, 100)
+
+	// Calculate trust index
+	calculator := gates.NewTrustCalculator()
+	trustIndex := calculator.CalculateWithHistory(run.GatePolicy, run.Gates, history)
+
+	// Check trust threshold
+	threshold := req.TrustThreshold
+	if threshold == 0 {
+		threshold = contracts.DefaultTrustThreshold
+	}
+
+	if trustIndex.Score < threshold && !req.Override {
+		writeJSONError(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("trust score %d is below threshold %d; set override=true to proceed", trustIndex.Score, threshold))
+		return
+	}
+
+	if req.Override && req.OverrideReason == "" {
+		writeJSONError(w, http.StatusBadRequest, "override_reason is required when override is true")
+		return
+	}
+
+	// Get all events for the capsule
+	evts, err := s.store.ListEvents(ctx, id, 10000)
+	if err != nil {
+		log.Printf("Warning: failed to list events: %v", err)
+	}
+
+	// Build export params
+	finalizedAt := time.Now().UTC()
+	finalizedBy := req.FinalizedBy
+	if finalizedBy == "" {
+		finalizedBy = "api"
+	}
+
+	exportParams := capsules.ExportParams{
+		Run:         run,
+		Events:      evts,
+		Trust:       trustIndex,
+		GateHistory: history,
+		FinalizedAt: finalizedAt,
+		FinalizedBy: finalizedBy,
+		Override:    req.Override,
+		OverrideReason: req.OverrideReason,
+	}
+
+	// Export capsule
+	result, err := s.capsuleExporter.Export(exportParams)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to export capsule: %v", err))
+		return
+	}
+
+	// Finalize run in DB
+	finalizeParams := store.FinalizeParams{
+		FinalizedAt:            finalizedAt,
+		FinalizedBy:            finalizedBy,
+		FinalizeReason:         req.Reason,
+		FinalizeOverride:       req.Override,
+		FinalizeOverrideReason: req.OverrideReason,
+		CapsuleID:              result.CapsuleID,
+		CapsulePath:            result.CapsulePath,
+		CapsuleManifestSHA256:  result.ManifestSHA256,
+	}
+
+	if err := s.store.FinalizeRun(ctx, id, finalizeParams); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to finalize run: %v", err))
+		return
+	}
+
+	// Emit run.finalized event
+	finalizedPayload := events.FinalizedPayload{
+		FinalizedAt:    finalizedAt.Format(time.RFC3339),
+		FinalizedBy:    finalizedBy,
+		CapsuleID:      result.CapsuleID,
+		CapsulePath:    result.CapsulePath,
+		ManifestSHA256: result.ManifestSHA256,
+		TrustScore:     trustIndex.Score,
+		TrustGrade:     trustIndex.Grade,
+		Override:       req.Override,
+		OverrideReason: req.OverrideReason,
+	}
+	evt := events.NewRunFinalizedEvent(id, finalizedPayload)
+	s.PublishEvent(ctx, evt)
+
+	writeJSON(w, http.StatusOK, contracts.FinalizeResponse{
+		RunID:          id,
+		Finalized:      true,
+		CapsuleID:      result.CapsuleID,
+		CapsulePath:    result.CapsulePath,
+		ManifestSHA256: result.ManifestSHA256,
+		FinalizedAt:    &finalizedAt,
+		FinalizedBy:    finalizedBy,
+		TrustScore:     trustIndex.Score,
+		TrustGrade:     trustIndex.Grade,
+		Override:       req.Override,
+		OverrideReason: req.OverrideReason,
+	})
+}
+
+// handleGetCapsule handles GET /runs/{id}/capsule (v0.9)
+func (s *Server) handleGetCapsule(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	if !run.IsFinalized() {
+		writeJSONError(w, http.StatusNotFound, "run is not finalized")
+		return
+	}
+
+	// Read capsule.json from the zip (staging is cleaned up after export)
+	zipPath := run.CapsulePath
+	if zipPath == "" {
+		writeJSONError(w, http.StatusNotFound, "capsule not found")
+		return
+	}
+
+	// Open the zip and read capsule.json
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to open capsule zip: %v", err))
+		return
+	}
+	defer zr.Close()
+
+	for _, f := range zr.File {
+		if f.Name == "capsule.json" {
+			rc, err := f.Open()
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, "failed to read capsule.json")
+				return
+			}
+			defer rc.Close()
+
+			w.Header().Set("Content-Type", "application/json")
+			io.Copy(w, rc)
+			return
+		}
+	}
+
+	writeJSONError(w, http.StatusNotFound, "capsule.json not found in archive")
+}
+
+// handleGetCapsuleZip handles GET /runs/{id}/capsule.zip (v0.9)
+func (s *Server) handleGetCapsuleZip(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	if !run.IsFinalized() {
+		writeJSONError(w, http.StatusNotFound, "run is not finalized")
+		return
+	}
+
+	if run.CapsulePath == "" {
+		writeJSONError(w, http.StatusNotFound, "capsule not found")
+		return
+	}
+
+	// Check if file exists
+	if _, err := os.Stat(run.CapsulePath); os.IsNotExist(err) {
+		writeJSONError(w, http.StatusNotFound, "capsule file not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-capsule.zip\"", id))
+	http.ServeFile(w, r, run.CapsulePath)
+}
+
+// handleVerifyCapsule handles POST /capsules/verify (v0.9)
+func (s *Server) handleVerifyCapsule(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Accept multipart form with file upload
+	if err := r.ParseMultipartForm(100 << 20); err != nil { // 100MB max
+		writeJSONError(w, http.StatusBadRequest, "invalid multipart form")
+		return
+	}
+
+	file, _, err := r.FormFile("capsule")
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "capsule file is required")
+		return
+	}
+	defer file.Close()
+
+	// Read file into memory
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, file); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "failed to read capsule file")
+		return
+	}
+
+	// Open as zip
+	zipReader, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid zip file")
+		return
+	}
+
+	// Verify capsule
+	verifier := capsules.NewVerifier()
+	result, err := verifier.Verify(zipReader)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("verification failed: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
 }

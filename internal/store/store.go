@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/AIfactory-hq/qfactory/pkg/contracts"
 	"github.com/AIfactory-hq/qfactory/pkg/events"
@@ -62,8 +63,27 @@ type Store interface {
 	// GetGatePolicy retrieves the gate policy for a run.
 	GetGatePolicy(ctx context.Context, runID string) (*contracts.GatePolicy, error)
 
+	// FinalizeRun marks a run as finalized with capsule metadata.
+	// Returns error if run is not completed or already finalized.
+	FinalizeRun(ctx context.Context, runID string, params FinalizeParams) error
+
+	// IsRunFinalized checks if a run is finalized.
+	IsRunFinalized(ctx context.Context, runID string) (bool, error)
+
 	// Close releases any resources held by the store.
 	Close() error
+}
+
+// FinalizeParams contains parameters for finalizing a run.
+type FinalizeParams struct {
+	FinalizedAt           time.Time
+	FinalizedBy           string
+	FinalizeReason        string
+	FinalizeOverride      bool
+	FinalizeOverrideReason string
+	CapsuleID             string
+	CapsulePath           string
+	CapsuleManifestSHA256 string
 }
 
 // SSEHub manages Server-Sent Events subscriptions in-memory.

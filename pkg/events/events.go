@@ -18,6 +18,7 @@ const (
 	EventTypeRunStarted     EventType = "run.started"
 	EventTypeRunCompleted   EventType = "run.completed"
 	EventTypeRunFailed      EventType = "run.failed"
+	EventTypeRunFinalized   EventType = "run.finalized" // v0.9
 	EventTypeGateStarted    EventType = "gate.started"
 	EventTypeGateCompleted  EventType = "gate.completed"
 	EventTypeGateFailed     EventType = "gate.failed"
@@ -259,5 +260,30 @@ func NewGateFailedRetryEvent(runID, level, name, executor, executionID string, e
 		RunID:     runID,
 		Timestamp: completedAt,
 		Payload:   payload,
+	}
+}
+
+// FinalizedPayload is the payload for run.finalized events. (v0.9)
+type FinalizedPayload struct {
+	FinalizedAt    string `json:"finalized_at"`
+	FinalizedBy    string `json:"finalized_by"`
+	CapsuleID      string `json:"capsule_id"`
+	CapsulePath    string `json:"capsule_path"`
+	ManifestSHA256 string `json:"manifest_sha256"`
+	TrustScore     int    `json:"trust_score"`
+	TrustGrade     string `json:"trust_grade"`
+	Override       bool   `json:"override,omitempty"`
+	OverrideReason string `json:"override_reason,omitempty"`
+}
+
+// NewRunFinalizedEvent creates a run.finalized event. (v0.9)
+func NewRunFinalizedEvent(runID string, payload FinalizedPayload) Event {
+	p, _ := json.Marshal(payload)
+	return Event{
+		ID:        generateEventID(),
+		Type:      EventTypeRunFinalized,
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Payload:   p,
 	}
 }

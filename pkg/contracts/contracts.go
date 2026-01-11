@@ -57,7 +57,11 @@ const (
 	RunStatusRunning   RunStatus = "running"
 	RunStatusCompleted RunStatus = "completed"
 	RunStatusFailed    RunStatus = "failed"
+	RunStatusFinalized RunStatus = "finalized"
 )
+
+// DefaultTrustThreshold is the minimum trust score required for finalization.
+const DefaultTrustThreshold = 80
 
 // StageState represents the state of a workflow stage.
 type StageState string
@@ -111,6 +115,20 @@ type WorkflowRun struct {
 	GatePolicy   *GatePolicy        `json:"gate_policy,omitempty"`
 	BudgetPolicy *BudgetPolicy      `json:"budget_policy,omitempty"`
 	ModelCalls   []ModelCallSummary `json:"model_calls,omitempty"`
+	// Finalization fields (v0.9)
+	FinalizedAt           *time.Time `json:"finalized_at,omitempty"`
+	FinalizedBy           string     `json:"finalized_by,omitempty"`
+	FinalizeReason        string     `json:"finalize_reason,omitempty"`
+	FinalizeOverride      bool       `json:"finalize_override,omitempty"`
+	FinalizeOverrideReason string    `json:"finalize_override_reason,omitempty"`
+	CapsuleID             string     `json:"capsule_id,omitempty"`
+	CapsulePath           string     `json:"capsule_path,omitempty"`
+	CapsuleManifestSHA256 string     `json:"capsule_manifest_sha256,omitempty"`
+}
+
+// IsFinalized returns true if the run has been finalized.
+func (r *WorkflowRun) IsFinalized() bool {
+	return r.Status == RunStatusFinalized || r.FinalizedAt != nil
 }
 
 // StageStatus represents the status of a single stage.
@@ -331,4 +349,76 @@ type EvidenceManifest struct {
 	Files       []string     `json:"files"`
 	GeneratedAt time.Time    `json:"generated_at"`
 	Version     string       `json:"version"`
+}
+
+// Capsule types (v0.9)
+
+// CapsuleDescriptor is the top-level descriptor for a signed capsule.
+// This is stored in capsule.json within the capsule ZIP.
+type CapsuleDescriptor struct {
+	CapsuleID         string     `json:"capsule_id"`
+	RunID             string     `json:"run_id"`
+	Version           string     `json:"version"`
+	GeneratedAt       time.Time  `json:"generated_at"`
+	ManifestSHA256    string     `json:"manifest_sha256"`
+	TrustScore        int        `json:"trust_score"`
+	TrustGrade        string     `json:"trust_grade"`
+	FinalizedAt       time.Time  `json:"finalized_at"`
+	FinalizedBy       string     `json:"finalized_by,omitempty"`
+	Override          bool       `json:"override,omitempty"`
+	OverrideReason    string     `json:"override_reason,omitempty"`
+	PublicKeyFingerprint string  `json:"public_key_fingerprint"`
+}
+
+// CapsuleManifest lists all files in the capsule with their hashes.
+// This is stored in manifest.json within the capsule ZIP.
+type CapsuleManifest struct {
+	CapsuleID   string         `json:"capsule_id"`
+	RunID       string         `json:"run_id"`
+	GeneratedAt time.Time      `json:"generated_at"`
+	Files       []CapsuleFile  `json:"files"`
+	TotalSize   int64          `json:"total_size"`
+	FileCount   int            `json:"file_count"`
+}
+
+// CapsuleFile describes a single file in the capsule manifest.
+type CapsuleFile struct {
+	Path      string `json:"path"`
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// FinalizeRequest is the request body for finalizing a run.
+type FinalizeRequest struct {
+	TrustThreshold int    `json:"trust_threshold,omitempty"` // default 80
+	Override       bool   `json:"override,omitempty"`
+	OverrideReason string `json:"override_reason,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	FinalizedBy    string `json:"finalized_by,omitempty"`
+}
+
+// FinalizeResponse is the response from finalizing a run.
+type FinalizeResponse struct {
+	RunID          string     `json:"run_id"`
+	Finalized      bool       `json:"finalized"`
+	CapsuleID      string     `json:"capsule_id,omitempty"`
+	CapsulePath    string     `json:"capsule_path,omitempty"`
+	ManifestSHA256 string     `json:"manifest_sha256,omitempty"`
+	FinalizedAt    *time.Time `json:"finalized_at,omitempty"`
+	FinalizedBy    string     `json:"finalized_by,omitempty"`
+	TrustScore     int        `json:"trust_score,omitempty"`
+	TrustGrade     string     `json:"trust_grade,omitempty"`
+	Override       bool       `json:"override,omitempty"`
+	OverrideReason string     `json:"override_reason,omitempty"`
+}
+
+// CapsuleVerifyResult is the result of verifying a capsule.
+type CapsuleVerifyResult struct {
+	Valid                bool     `json:"valid"`
+	Errors               []string `json:"errors,omitempty"`
+	ManifestSHA256       string   `json:"manifest_sha256,omitempty"`
+	CapsuleID            string   `json:"capsule_id,omitempty"`
+	RunID                string   `json:"run_id,omitempty"`
+	PublicKeyFingerprint string   `json:"public_key_fingerprint,omitempty"`
+	FilesVerified        int      `json:"files_verified,omitempty"`
 }

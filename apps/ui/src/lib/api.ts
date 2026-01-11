@@ -1,4 +1,4 @@
-import type { WorkflowRun, ListRunsResponse, GateResult, SearchResponse, IndexRequest, IndexResponse, TrustIndex, PolicyDecision, GatePolicy, GateDiffResponse, LatestGateResponse } from './types';
+import type { WorkflowRun, ListRunsResponse, GateResult, SearchResponse, IndexRequest, IndexResponse, TrustIndex, PolicyDecision, GatePolicy, GateDiffResponse, LatestGateResponse, FinalizeRequest, FinalizeResponse, CapsuleDescriptor, CapsuleVerifyResult } from './types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8090';
 
@@ -108,5 +108,35 @@ export const api = {
 
   getLatestGate(id: string, level: string, name: string): Promise<LatestGateResponse> {
     return fetchJSON<LatestGateResponse>(`/runs/${id}/gates/${level}/${name}/latest`);
+  },
+
+  // Finalization and Capsule API (v0.9)
+  finalizeRun(id: string, req: FinalizeRequest): Promise<FinalizeResponse> {
+    return fetchJSON<FinalizeResponse>(`/runs/${id}/finalize`, {
+      method: 'POST',
+      body: JSON.stringify(req),
+    });
+  },
+
+  getCapsule(id: string): Promise<CapsuleDescriptor> {
+    return fetchJSON<CapsuleDescriptor>(`/runs/${id}/capsule`);
+  },
+
+  getCapsuleZipUrl(id: string): string {
+    return `${API_BASE}/runs/${id}/capsule.zip`;
+  },
+
+  async verifyCapsule(file: File): Promise<CapsuleVerifyResult> {
+    const formData = new FormData();
+    formData.append('capsule', file);
+    const res = await fetch(`${API_BASE}/capsules/verify`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(error.error || `HTTP ${res.status}`);
+    }
+    return res.json();
   },
 };

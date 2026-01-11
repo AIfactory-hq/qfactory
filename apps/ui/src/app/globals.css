@@ -53,6 +53,10 @@ body {
     @apply bg-green-100 text-green-800;
   }
 
+  .badge-finalized {
+    @apply bg-purple-100 text-purple-800;
+  }
+
   .table-header {
     @apply px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider;
   }

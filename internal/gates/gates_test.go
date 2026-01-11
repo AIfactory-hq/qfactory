@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AIfactory-hq/qfactory/internal/store"
 	"github.com/AIfactory-hq/qfactory/pkg/contracts"
 	"github.com/AIfactory-hq/qfactory/pkg/events"
 )
@@ -139,6 +140,18 @@ func (m *mockStore) GetGatePolicy(ctx context.Context, runID string) (*contracts
 
 func (m *mockStore) Close() error {
 	return nil
+}
+
+func (m *mockStore) FinalizeRun(ctx context.Context, runID string, params store.FinalizeParams) error {
+	return nil
+}
+
+func (m *mockStore) IsRunFinalized(ctx context.Context, runID string) (bool, error) {
+	run, ok := m.runs[runID]
+	if !ok {
+		return false, nil
+	}
+	return run.IsFinalized(), nil
 }
 
 // mockEventPublisher implements EventPublisher for testing.

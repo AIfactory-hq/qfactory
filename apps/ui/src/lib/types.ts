@@ -37,7 +37,7 @@ export interface GateHistoryItem {
 export interface WorkflowRun {
   id: string;
   temporal_id?: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'finalized';
   current_stage?: string;
   stages?: StageStatus[];
   created_at?: string;
@@ -46,6 +46,15 @@ export interface WorkflowRun {
   error?: string;
   gates?: GateResult[];
   gate_history?: GateHistoryItem[];
+  // Finalization fields (v0.9)
+  finalized_at?: string;
+  finalized_by?: string;
+  finalize_reason?: string;
+  finalize_override?: boolean;
+  finalize_override_reason?: string;
+  capsule_id?: string;
+  capsule_path?: string;
+  capsule_manifest_sha256?: string;
 }
 
 export interface ListRunsResponse {
@@ -167,4 +176,52 @@ export interface LatestGateResponse {
   name: string;
   execution_id: string;
   result?: GateResult;
+}
+
+// Finalization types (v0.9)
+export interface FinalizeRequest {
+  trust_threshold?: number;
+  override?: boolean;
+  override_reason?: string;
+  reason?: string;
+  finalized_by?: string;
+}
+
+export interface FinalizeResponse {
+  run_id: string;
+  finalized: boolean;
+  capsule_id?: string;
+  capsule_path?: string;
+  manifest_sha256?: string;
+  finalized_at?: string;
+  finalized_by?: string;
+  trust_score?: number;
+  trust_grade?: string;
+  override?: boolean;
+  override_reason?: string;
+}
+
+export interface CapsuleDescriptor {
+  capsule_id: string;
+  run_id: string;
+  version: string;
+  generated_at: string;
+  manifest_sha256: string;
+  trust_score: number;
+  trust_grade: string;
+  finalized_at: string;
+  finalized_by: string;
+  override: boolean;
+  override_reason?: string;
+  public_key_fingerprint: string;
+}
+
+export interface CapsuleVerifyResult {
+  valid: boolean;
+  errors?: string[];
+  capsule_id?: string;
+  run_id?: string;
+  manifest_sha256?: string;
+  public_key_fingerprint?: string;
+  files_verified?: number;
 }

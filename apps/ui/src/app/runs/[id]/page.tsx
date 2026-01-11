@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { api } from '@/lib/api';
-import type { WorkflowRun, SSEEvent, SearchResult, GateHistoryItem, TrustIndex } from '@/lib/types';
+import type { WorkflowRun, SSEEvent, SearchResult, GateHistoryItem, TrustIndex, FinalizeResponse } from '@/lib/types';
 
 export default function RunDetailPage() {
   const params = useParams();
@@ -25,6 +25,13 @@ export default function RunDetailPage() {
   const [loadingTrust, setLoadingTrust] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventsEndRef = useRef<HTMLDivElement>(null);
+
+  // Finalization state (v0.9)
+  const [trustThreshold, setTrustThreshold] = useState(80);
+  const [override, setOverride] = useState(false);
+  const [overrideReason, setOverrideReason] = useState('');
+  const [finalizing, setFinalizing] = useState(false);
+  const [finalizeError, setFinalizeError] = useState<string | null>(null);
 
   // Search state
   const [searchQuery, setSearchQuery] = useState('');
@@ -153,6 +160,25 @@ export default function RunDetailPage() {
     }
   }
 
+  async function handleFinalize() {
+    setFinalizing(true);
+    setFinalizeError(null);
+    try {
+      await api.finalizeRun(runId, {
+        trust_threshold: trustThreshold,
+        override,
+        override_reason: override ? overrideReason : undefined,
+        finalized_by: 'ui-user',
+      });
+      await loadRun();
+      await loadTrustIndex();
+    } catch (err) {
+      setFinalizeError(err instanceof Error ? err.message : 'Failed to finalize run');
+    } finally {
+      setFinalizing(false);
+    }
+  }
+
   async function loadHistory() {
     try {
       const data = await api.getRunWithHistory(runId);
@@ -241,6 +267,8 @@ export default function RunDetailPage() {
   }
 
   const stages = ['spec', 'contract', 'plan', 'implement', 'verify'];
+  const isFinalized = run?.status === 'finalized';
+  const canRunGates = run?.status === 'completed';
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-8">
@@ -252,7 +280,9 @@ export default function RunDetailPage() {
         <div className="flex items-center gap-4 mt-2">
           <span
             className={`badge ${
-              run?.status === 'completed'
+              run?.status === 'finalized'
+                ? 'badge-finalized'
+                : run?.status === 'completed'
                 ? 'badge-completed'
                 : run?.status === 'failed'
                 ? 'badge-failed'
@@ -263,6 +293,11 @@ export default function RunDetailPage() {
           >
             {run?.status}
           </span>
+          {run?.status === 'finalized' && run?.capsule_id && (
+            <span className="text-xs bg-purple-100 text-purple-800 px-2 py-0.5 rounded font-mono">
+              Capsule: {run.capsule_id.substring(0, 12)}...
+            </span>
+          )}
           {run?.temporal_id && (
             <span className="text-sm text-gray-500">Temporal: {run.temporal_id}</span>
           )}
@@ -361,6 +396,134 @@ export default function RunDetailPage() {
         )}
       </div>
 
+      {/* Finalize Card (v0.9) */}
+      <div className="mb-6 card">
+        <h2 className="text-lg font-semibold text-gray-900 mb-4">Run Finalization</h2>
+        {isFinalized ? (
+          <div className="space-y-4">
+            <div className="flex items-center gap-2">
+              <span className="px-3 py-1 bg-purple-100 text-purple-800 rounded-full text-sm font-medium">
+                Finalized
+              </span>
+              {run.finalize_override && (
+                <span className="px-2 py-1 bg-yellow-100 text-yellow-800 rounded text-xs">
+                  Override Applied
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-4 text-sm">
+              <div>
+                <div className="text-gray-500">Finalized At</div>
+                <div className="font-mono">{formatDate(run.finalized_at)}</div>
+              </div>
+              <div>
+                <div className="text-gray-500">Finalized By</div>
+                <div className="font-mono">{run.finalized_by || '-'}</div>
+              </div>
+              <div>
+                <div className="text-gray-500">Capsule ID</div>
+                <div className="font-mono text-xs break-all">{run.capsule_id || '-'}</div>
+              </div>
+              <div>
+                <div className="text-gray-500">Manifest SHA256</div>
+                <div className="font-mono text-xs break-all">{run.capsule_manifest_sha256?.substring(0, 16)}...</div>
+              </div>
+            </div>
+            {run.finalize_override && run.finalize_override_reason && (
+              <div className="p-2 bg-yellow-50 border border-yellow-200 rounded text-sm">
+                <span className="font-medium">Override Reason:</span> {run.finalize_override_reason}
+              </div>
+            )}
+            <div className="flex gap-3">
+              <a
+                href={api.getCapsuleZipUrl(runId)}
+                className="btn btn-primary"
+                download
+              >
+                Download Capsule
+              </a>
+            </div>
+          </div>
+        ) : canRunGates ? (
+          <div className="space-y-4">
+            <p className="text-sm text-gray-600">
+              Finalize this run to create a signed, immutable capsule artifact. Once finalized, no further modifications are allowed.
+            </p>
+
+            {finalizeError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">
+                {finalizeError}
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Trust Threshold (0-100)
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={trustThreshold}
+                  onChange={(e) => setTrustThreshold(parseInt(e.target.value) || 0)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Current trust score: {trustIndex?.score ?? '?'}
+                </p>
+              </div>
+              <div className="flex flex-col justify-end">
+                {trustIndex && trustIndex.score < trustThreshold && (
+                  <p className="text-xs text-yellow-600 mb-2">
+                    Trust score is below threshold. Enable override to proceed.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={override}
+                  onChange={(e) => setOverride(e.target.checked)}
+                  className="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
+                />
+                <span className="text-sm text-gray-700">Override trust threshold check</span>
+              </label>
+
+              {override && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Override Reason (required)
+                  </label>
+                  <input
+                    type="text"
+                    value={overrideReason}
+                    onChange={(e) => setOverrideReason(e.target.value)}
+                    placeholder="Why is this override necessary?"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+              )}
+            </div>
+
+            <button
+              onClick={handleFinalize}
+              disabled={finalizing || (override && !overrideReason.trim())}
+              className="btn btn-primary"
+            >
+              {finalizing ? 'Finalizing...' : 'Finalize Run'}
+            </button>
+          </div>
+        ) : (
+          <p className="text-gray-500 text-sm">
+            Run must be completed before it can be finalized. Current status: {run?.status}
+          </p>
+        )}
+      </div>
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Left Column: Stages and Gates */}
         <div className="space-y-6">
@@ -436,8 +599,9 @@ export default function RunDetailPage() {
             <div className="mt-4 flex gap-3">
               <button
                 onClick={handleRunPR1}
-                disabled={runningGate}
+                disabled={runningGate || isFinalized}
                 className="btn btn-primary"
+                title={isFinalized ? 'Run is finalized and cannot be modified' : ''}
               >
                 {runningGate ? 'Running...' : 'Run PR1 Gate'}
               </button>
@@ -499,18 +663,18 @@ export default function RunDetailPage() {
             <div className="mt-4 flex gap-3 flex-wrap">
               <button
                 onClick={handleRunPR2}
-                disabled={runningPR2 || run?.status !== 'completed'}
+                disabled={runningPR2 || !canRunGates || isFinalized}
                 className="btn btn-primary"
-                title={run?.status !== 'completed' ? 'Run must be completed to run PR2 gate' : ''}
+                title={isFinalized ? 'Run is finalized' : !canRunGates ? 'Run must be completed to run PR2 gate' : ''}
               >
                 {runningPR2 ? 'Running...' : 'Run PR2 Gate'}
               </button>
               {pr2Gate && (
                 <button
                   onClick={() => handleRetryGate('PR2', 'integration_smoke')}
-                  disabled={retryingGate === 'PR2/integration_smoke' || run?.status !== 'completed'}
+                  disabled={retryingGate === 'PR2/integration_smoke' || !canRunGates || isFinalized}
                   className="btn btn-secondary"
-                  title="Retry this gate with lineage tracking"
+                  title={isFinalized ? 'Run is finalized' : 'Retry this gate with lineage tracking'}
                 >
                   {retryingGate === 'PR2/integration_smoke' ? 'Retrying...' : 'Retry'}
                 </button>
@@ -575,18 +739,18 @@ export default function RunDetailPage() {
             <div className="mt-4 flex gap-3 flex-wrap">
               <button
                 onClick={handleRunPR3}
-                disabled={runningPR3 || run?.status !== 'completed'}
+                disabled={runningPR3 || !canRunGates || isFinalized}
                 className="btn btn-primary"
-                title={run?.status !== 'completed' ? 'Run must be completed to run PR3 gate' : ''}
+                title={isFinalized ? 'Run is finalized' : !canRunGates ? 'Run must be completed to run PR3 gate' : ''}
               >
                 {runningPR3 ? 'Running...' : 'Run PR3 Gate'}
               </button>
               {pr3Gate && (
                 <button
                   onClick={() => handleRetryGate('PR3', 'security_scan')}
-                  disabled={retryingGate === 'PR3/security_scan' || run?.status !== 'completed'}
+                  disabled={retryingGate === 'PR3/security_scan' || !canRunGates || isFinalized}
                   className="btn btn-secondary"
-                  title="Retry this gate with lineage tracking"
+                  title={isFinalized ? 'Run is finalized' : 'Retry this gate with lineage tracking'}
                 >
                   {retryingGate === 'PR3/security_scan' ? 'Retrying...' : 'Retry'}
                 </button>

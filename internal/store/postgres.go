@@ -76,6 +76,17 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		return fmt.Errorf("failed to execute migration 002: %w", err)
 	}
 
+	// Run migration 003
+	migration003SQL, err := os.ReadFile("infra/migrations/003_gate_policy.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read migration 003: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, string(migration003SQL))
+	if err != nil {
+		return fmt.Errorf("failed to execute migration 003: %w", err)
+	}
+
 	log.Println("Database migrations applied successfully")
 	return nil
 }
@@ -105,6 +116,14 @@ func (s *PostgresStore) CreateRun(ctx context.Context, run *contracts.WorkflowRu
 		}
 	}
 
+	var gatePolicyJSON []byte
+	if run.GatePolicy != nil {
+		gatePolicyJSON, err = json.Marshal(run.GatePolicy)
+		if err != nil {
+			return fmt.Errorf("failed to marshal gate policy: %w", err)
+		}
+	}
+
 	modelCallsJSON, err := json.Marshal(run.ModelCalls)
 	if err != nil {
 		return fmt.Errorf("failed to marshal model calls: %w", err)
@@ -112,8 +131,8 @@ func (s *PostgresStore) CreateRun(ctx context.Context, run *contracts.WorkflowRu
 
 	query := `
 		INSERT INTO runs (id, temporal_id, status, current_stage, created_at, updated_at,
-		                  completed_at, error, stages_json, gates_json, budget_policy_json, model_calls_json)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		                  completed_at, error, stages_json, gates_json, budget_policy_json, gate_policy_json, model_calls_json)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
 
 	_, err = s.db.ExecContext(ctx, query,
@@ -128,6 +147,7 @@ func (s *PostgresStore) CreateRun(ctx context.Context, run *contracts.WorkflowRu
 		stagesJSON,
 		gatesJSON,
 		nullBytes(budgetPolicyJSON),
+		nullBytes(gatePolicyJSON),
 		modelCallsJSON,
 	)
 	if err != nil {
@@ -142,7 +162,7 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*contracts.Workf
 	query := `
 		SELECT id, temporal_id, status, current_stage, created_at, updated_at,
 		       completed_at, error, stages_json, gates_json, budget_policy_json,
-		       budget_status_json, model_calls_json
+		       gate_policy_json, budget_status_json, model_calls_json
 		FROM runs WHERE id = $1
 	`
 
@@ -150,7 +170,7 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*contracts.Workf
 	var temporalID, currentStage, errorStr sql.NullString
 	var completedAt sql.NullTime
 	var stagesJSON, gatesJSON, modelCallsJSON []byte
-	var budgetPolicyJSON, budgetStatusJSON sql.NullString
+	var budgetPolicyJSON, gatePolicyJSON, budgetStatusJSON sql.NullString
 
 	err := s.db.QueryRowContext(ctx, query, id).Scan(
 		&run.ID,
@@ -164,6 +184,7 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*contracts.Workf
 		&stagesJSON,
 		&gatesJSON,
 		&budgetPolicyJSON,
+		&gatePolicyJSON,
 		&budgetStatusJSON,
 		&modelCallsJSON,
 	)
@@ -198,6 +219,13 @@ func (s *PostgresStore) GetRun(ctx context.Context, id string) (*contracts.Workf
 		}
 	}
 
+	if gatePolicyJSON.Valid && gatePolicyJSON.String != "" && gatePolicyJSON.String != "{}" {
+		run.GatePolicy = &contracts.GatePolicy{}
+		if err := json.Unmarshal([]byte(gatePolicyJSON.String), run.GatePolicy); err != nil {
+			return nil, false, fmt.Errorf("failed to unmarshal gate policy: %w", err)
+		}
+	}
+
 	if len(modelCallsJSON) > 0 {
 		if err := json.Unmarshal(modelCallsJSON, &run.ModelCalls); err != nil {
 			return nil, false, fmt.Errorf("failed to unmarshal model calls: %w", err)
@@ -215,7 +243,7 @@ func (s *PostgresStore) ListRuns(ctx context.Context, limit int) ([]*contracts.W
 
 	query := `
 		SELECT id, temporal_id, status, current_stage, created_at, updated_at,
-		       completed_at, error, stages_json, gates_json, budget_policy_json, model_calls_json
+		       completed_at, error, stages_json, gates_json, budget_policy_json, gate_policy_json, model_calls_json
 		FROM runs
 		ORDER BY updated_at DESC
 		LIMIT $1
@@ -233,7 +261,7 @@ func (s *PostgresStore) ListRuns(ctx context.Context, limit int) ([]*contracts.W
 		var temporalID, currentStage, errorStr sql.NullString
 		var completedAt sql.NullTime
 		var stagesJSON, gatesJSON, modelCallsJSON []byte
-		var budgetPolicyJSON sql.NullString
+		var budgetPolicyJSON, gatePolicyJSON sql.NullString
 
 		err := rows.Scan(
 			&run.ID,
@@ -247,6 +275,7 @@ func (s *PostgresStore) ListRuns(ctx context.Context, limit int) ([]*contracts.W
 			&stagesJSON,
 			&gatesJSON,
 			&budgetPolicyJSON,
+			&gatePolicyJSON,
 			&modelCallsJSON,
 		)
 		if err != nil {
@@ -270,6 +299,10 @@ func (s *PostgresStore) ListRuns(ctx context.Context, limit int) ([]*contracts.W
 			run.BudgetPolicy = &contracts.BudgetPolicy{}
 			json.Unmarshal([]byte(budgetPolicyJSON.String), run.BudgetPolicy)
 		}
+		if gatePolicyJSON.Valid && gatePolicyJSON.String != "" && gatePolicyJSON.String != "{}" {
+			run.GatePolicy = &contracts.GatePolicy{}
+			json.Unmarshal([]byte(gatePolicyJSON.String), run.GatePolicy)
+		}
 		if len(modelCallsJSON) > 0 {
 			json.Unmarshal(modelCallsJSON, &run.ModelCalls)
 		}
@@ -291,6 +324,11 @@ func (s *PostgresStore) UpdateRun(ctx context.Context, run *contracts.WorkflowRu
 		budgetPolicyJSON, _ = json.Marshal(run.BudgetPolicy)
 	}
 
+	var gatePolicyJSON []byte
+	if run.GatePolicy != nil {
+		gatePolicyJSON, _ = json.Marshal(run.GatePolicy)
+	}
+
 	query := `
 		UPDATE runs SET
 			temporal_id = $2,
@@ -302,7 +340,8 @@ func (s *PostgresStore) UpdateRun(ctx context.Context, run *contracts.WorkflowRu
 			stages_json = $8,
 			gates_json = $9,
 			budget_policy_json = $10,
-			model_calls_json = $11
+			gate_policy_json = $11,
+			model_calls_json = $12
 		WHERE id = $1
 	`
 
@@ -317,6 +356,7 @@ func (s *PostgresStore) UpdateRun(ctx context.Context, run *contracts.WorkflowRu
 		stagesJSON,
 		gatesJSON,
 		nullBytes(budgetPolicyJSON),
+		nullBytes(gatePolicyJSON),
 		modelCallsJSON,
 	)
 	if err != nil {
@@ -647,6 +687,56 @@ func (s *PostgresStore) GetBudgetStatus(ctx context.Context, runID string) (*con
 	}
 
 	return &status, nil
+}
+
+// UpdateGatePolicy updates the gate policy for a run.
+func (s *PostgresStore) UpdateGatePolicy(ctx context.Context, runID string, policy *contracts.GatePolicy) error {
+	var policyJSON []byte
+	var err error
+	if policy != nil {
+		policyJSON, err = json.Marshal(policy)
+		if err != nil {
+			return fmt.Errorf("failed to marshal gate policy: %w", err)
+		}
+	}
+
+	query := `UPDATE runs SET gate_policy_json = $2, updated_at = $3 WHERE id = $1`
+	result, err := s.db.ExecContext(ctx, query, runID, nullBytes(policyJSON), time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("failed to update gate policy: %w", err)
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("run not found: %s", runID)
+	}
+
+	return nil
+}
+
+// GetGatePolicy retrieves the gate policy for a run.
+func (s *PostgresStore) GetGatePolicy(ctx context.Context, runID string) (*contracts.GatePolicy, error) {
+	query := `SELECT gate_policy_json FROM runs WHERE id = $1`
+
+	var gatePolicyJSON sql.NullString
+	err := s.db.QueryRowContext(ctx, query, runID).Scan(&gatePolicyJSON)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if !gatePolicyJSON.Valid || gatePolicyJSON.String == "" || gatePolicyJSON.String == "{}" {
+		return nil, nil
+	}
+
+	var policy contracts.GatePolicy
+	if err := json.Unmarshal([]byte(gatePolicyJSON.String), &policy); err != nil {
+		return nil, err
+	}
+
+	return &policy, nil
 }
 
 // Helper functions for nullable types

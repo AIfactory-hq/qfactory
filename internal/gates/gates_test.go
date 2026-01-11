@@ -14,18 +14,20 @@ import (
 
 // mockStore implements store.Store for testing.
 type mockStore struct {
-	runs        map[string]*contracts.WorkflowRun
-	gates       map[string][]contracts.GateResult
-	gateHistory map[string][]contracts.GateHistoryItem
-	events      []events.Event
+	runs         map[string]*contracts.WorkflowRun
+	gates        map[string][]contracts.GateResult
+	gateHistory  map[string][]contracts.GateHistoryItem
+	gatePolicies map[string]*contracts.GatePolicy
+	events       []events.Event
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		runs:        make(map[string]*contracts.WorkflowRun),
-		gates:       make(map[string][]contracts.GateResult),
-		gateHistory: make(map[string][]contracts.GateHistoryItem),
-		events:      []events.Event{},
+		runs:         make(map[string]*contracts.WorkflowRun),
+		gates:        make(map[string][]contracts.GateResult),
+		gateHistory:  make(map[string][]contracts.GateHistoryItem),
+		gatePolicies: make(map[string]*contracts.GatePolicy),
+		events:       []events.Event{},
 	}
 }
 
@@ -107,6 +109,15 @@ func (m *mockStore) UpdateBudgetStatus(ctx context.Context, runID string, status
 
 func (m *mockStore) GetBudgetStatus(ctx context.Context, runID string) (*contracts.BudgetStatus, error) {
 	return nil, nil
+}
+
+func (m *mockStore) UpdateGatePolicy(ctx context.Context, runID string, policy *contracts.GatePolicy) error {
+	m.gatePolicies[runID] = policy
+	return nil
+}
+
+func (m *mockStore) GetGatePolicy(ctx context.Context, runID string) (*contracts.GatePolicy, error) {
+	return m.gatePolicies[runID], nil
 }
 
 func (m *mockStore) Close() error {
@@ -395,5 +406,273 @@ func TestGateNameNormalization(t *testing.T) {
 	history := store.gateHistory[run.ID]
 	if len(history) > 0 && history[0].Result.Name != "default" {
 		t.Errorf("expected history name 'default', got '%s'", history[0].Result.Name)
+	}
+}
+
+// PolicyEvaluator tests
+
+func TestPolicyEvaluator_NilPolicy(t *testing.T) {
+	evaluator := NewPolicyEvaluator()
+
+	decision := evaluator.Evaluate(nil, nil)
+
+	if !decision.Allowed {
+		t.Error("expected decision to be allowed with nil policy")
+	}
+	if decision.Message != "no policy defined" {
+		t.Errorf("expected message 'no policy defined', got '%s'", decision.Message)
+	}
+}
+
+func TestPolicyEvaluator_RequiredLevels(t *testing.T) {
+	evaluator := NewPolicyEvaluator()
+
+	policy := &contracts.GatePolicy{
+		RequiredLevels: []string{"PR1", "PR2"},
+	}
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now},
+		{Level: "PR2", Name: "integration", Passed: true, Timestamp: now},
+	}
+
+	decision := evaluator.Evaluate(policy, gates)
+
+	if !decision.Allowed {
+		t.Errorf("expected decision to be allowed, got message: %s", decision.Message)
+	}
+}
+
+func TestPolicyEvaluator_MissingGates(t *testing.T) {
+	evaluator := NewPolicyEvaluator()
+
+	policy := &contracts.GatePolicy{
+		RequiredLevels: []string{"PR1", "PR2"},
+	}
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now},
+	}
+
+	decision := evaluator.Evaluate(policy, gates)
+
+	if decision.Allowed {
+		t.Error("expected decision to be denied due to missing PR2")
+	}
+	if len(decision.Missing) != 1 {
+		t.Errorf("expected 1 missing gate, got %d", len(decision.Missing))
+	}
+}
+
+func TestPolicyEvaluator_FailingGates(t *testing.T) {
+	evaluator := NewPolicyEvaluator()
+
+	policy := &contracts.GatePolicy{
+		RequiredLevels: []string{"PR1"},
+	}
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: false, Timestamp: now},
+	}
+
+	decision := evaluator.Evaluate(policy, gates)
+
+	if decision.Allowed {
+		t.Error("expected decision to be denied due to failing gate")
+	}
+	if len(decision.Failing) != 1 {
+		t.Errorf("expected 1 failing gate, got %d", len(decision.Failing))
+	}
+}
+
+func TestPolicyEvaluator_FailOpen(t *testing.T) {
+	evaluator := NewPolicyEvaluator()
+
+	policy := &contracts.GatePolicy{
+		RequiredLevels: []string{"PR1", "PR2"},
+		FailOpen:       true,
+	}
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now},
+	}
+
+	decision := evaluator.Evaluate(policy, gates)
+
+	if !decision.Allowed {
+		t.Error("expected decision to be allowed with fail_open")
+	}
+	if decision.Message != "fail_open enabled; issues ignored" {
+		t.Errorf("expected fail_open message, got '%s'", decision.Message)
+	}
+}
+
+// TrustCalculator tests
+
+func TestTrustCalculator_NoGates(t *testing.T) {
+	calculator := NewTrustCalculator()
+
+	result := calculator.Calculate(nil, nil)
+
+	if result.Score != 0 {
+		t.Errorf("expected score 0, got %d", result.Score)
+	}
+	if result.Grade != "F" {
+		t.Errorf("expected grade F, got %s", result.Grade)
+	}
+}
+
+func TestTrustCalculator_AllPassed(t *testing.T) {
+	calculator := NewTrustCalculator()
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now},
+		{Level: "PR2", Name: "integration", Passed: true, Timestamp: now},
+		{Level: "PR3", Name: "security", Passed: true, Timestamp: now},
+	}
+
+	result := calculator.Calculate(nil, gates)
+
+	if result.Score < 90 {
+		t.Errorf("expected score >= 90, got %d", result.Score)
+	}
+	if result.Grade != "A" {
+		t.Errorf("expected grade A, got %s", result.Grade)
+	}
+	if result.Breakdown.PassedRequired != 3 {
+		t.Errorf("expected 3 passed, got %d", result.Breakdown.PassedRequired)
+	}
+}
+
+func TestTrustCalculator_WithFailures(t *testing.T) {
+	calculator := NewTrustCalculator()
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now},
+		{Level: "PR2", Name: "integration", Passed: false, Timestamp: now},
+	}
+
+	result := calculator.Calculate(nil, gates)
+
+	if result.Breakdown.Failed != 1 {
+		t.Errorf("expected 1 failed, got %d", result.Breakdown.Failed)
+	}
+	if result.Grade == "A" {
+		t.Error("expected grade less than A with failures")
+	}
+}
+
+func TestTrustCalculator_Grades(t *testing.T) {
+	calculator := NewTrustCalculator()
+
+	tests := []struct {
+		score int
+		grade string
+	}{
+		{95, "A"},
+		{85, "B"},
+		{75, "C"},
+		{65, "D"},
+		{55, "F"},
+	}
+
+	for _, tc := range tests {
+		grade := calculator.scoreToGrade(tc.score)
+		if grade != tc.grade {
+			t.Errorf("score %d: expected grade %s, got %s", tc.score, tc.grade, grade)
+		}
+	}
+}
+
+// Executor tests
+
+func TestLocalExecutor_Name(t *testing.T) {
+	executor := NewLocalExecutor()
+	if executor.Name() != "local" {
+		t.Errorf("expected name 'local', got '%s'", executor.Name())
+	}
+}
+
+func TestLocalExecutor_Execute(t *testing.T) {
+	executor := NewLocalExecutor()
+
+	run := &contracts.WorkflowRun{
+		ID:     "test-run",
+		Status: contracts.RunStatusCompleted,
+	}
+
+	gate := &mockGate{level: "PR1", name: "test", passed: true}
+	output, err := executor.Execute(context.Background(), run, gate)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !output.Result.Passed {
+		t.Error("expected gate to pass")
+	}
+	// The mockGate already sets executor to "mock", so LocalExecutor preserves it
+	// (only sets to "local" if executor is empty)
+	if output.Result.Executor != "mock" {
+		t.Errorf("expected executor 'mock' (from mock gate), got '%s'", output.Result.Executor)
+	}
+}
+
+func TestRemoteExecutor_Name(t *testing.T) {
+	executor := NewRemoteExecutor("http://localhost:9090")
+	if executor.Name() != "remote" {
+		t.Errorf("expected name 'remote', got '%s'", executor.Name())
+	}
+}
+
+func TestUnitTestGateMetadata(t *testing.T) {
+	gate := NewUnitTestGate()
+
+	if gate.Level() != contracts.GateLevelPR1 {
+		t.Errorf("expected level PR1, got %s", gate.Level())
+	}
+	if gate.Name() != "unit_tests" {
+		t.Errorf("expected name unit_tests, got %s", gate.Name())
+	}
+}
+
+func TestGateRunnerWithExecutor(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gates_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	store := newMockStore()
+	runner := NewGateRunner(store, tmpDir)
+
+	run := &contracts.WorkflowRun{
+		ID:        "test-run-executor",
+		Status:    contracts.RunStatusCompleted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	store.CreateRun(context.Background(), run)
+
+	gate := &mockGate{level: "PR2", name: "test_gate", passed: true}
+	executor := NewLocalExecutor()
+
+	result, err := runner.RunGateWithExecutor(context.Background(), run.ID, gate, executor)
+	if err != nil {
+		t.Fatalf("RunGateWithExecutor failed: %v", err)
+	}
+
+	if !result.Passed {
+		t.Error("expected gate to pass")
+	}
+	// The mock gate sets executor to "mock" in its Run(), but LocalExecutor sets it to "local"
+	// Since the mockGate returns "mock", the executor preserves that unless empty
+	if result.Executor != "mock" {
+		t.Errorf("expected executor 'mock', got '%s'", result.Executor)
 	}
 }

@@ -139,6 +139,12 @@ func main() {
 	mux.HandleFunc("POST /runs/{id}/model/complete", server.handleModelComplete)
 	mux.HandleFunc("PATCH /runs/{id}/budget", server.handlePatchBudget)
 
+	// Gate policy and trust endpoints (v0.6)
+	mux.HandleFunc("POST /runs/{id}/gates/{level}/{name}/run", server.handleRunGate)
+	mux.HandleFunc("PATCH /runs/{id}/gate-policy", server.handlePatchGatePolicy)
+	mux.HandleFunc("GET /runs/{id}/gate-policy/decision", server.handleGetPolicyDecision)
+	mux.HandleFunc("GET /runs/{id}/trust", server.handleGetTrustIndex)
+
 	addr := ":8090"
 	log.Printf("Control-plane API listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
@@ -1390,4 +1396,229 @@ func (s *Server) handlePatchBudget(w http.ResponseWriter, r *http.Request) {
 	s.budgetMgr.SetPolicy(id, &policy)
 
 	writeJSON(w, http.StatusOK, run)
+}
+
+// RunGateRequest is the request body for running a gate.
+type RunGateRequest struct {
+	Executor       string `json:"executor,omitempty"`        // "local" or "remote"
+	RunnerURL      string `json:"runner_url,omitempty"`      // required if executor is "remote"
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"` // optional timeout
+}
+
+// handleRunGate handles POST /runs/{id}/gates/{level}/{name}/run
+func (s *Server) handleRunGate(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	level := r.PathValue("level")
+	name := r.PathValue("name")
+
+	if id == "" || level == "" || name == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id, level, or name")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if run is not completed
+	if run.Status != contracts.RunStatusCompleted {
+		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to run gate (current status: %s)", run.Status))
+		return
+	}
+
+	// Parse request body
+	var req RunGateRequest
+	if r.Body != nil && r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+
+	// Create gate based on level
+	var gate gates.Gate
+	switch level {
+	case contracts.GateLevelPR1:
+		gate = gates.NewUnitTestGate()
+	case contracts.GateLevelPR2:
+		gate = gates.NewIntegrationSmokeGate()
+	case contracts.GateLevelPR3:
+		gate = gates.NewSecurityScanGate()
+	default:
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("unsupported gate level: %s", level))
+		return
+	}
+
+	// Create executor based on request
+	var executor gates.GateExecutor
+	if req.Executor == "remote" {
+		if req.RunnerURL == "" {
+			writeJSONError(w, http.StatusBadRequest, "runner_url is required for remote executor")
+			return
+		}
+		executor = gates.NewRemoteExecutor(req.RunnerURL)
+	} else {
+		executor = gates.NewLocalExecutor()
+	}
+
+	// Set up context with timeout
+	timeoutSeconds := 300 // default 5 minutes
+	if req.TimeoutSeconds > 0 {
+		timeoutSeconds = req.TimeoutSeconds
+	}
+	gateCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+
+	// Execute gate with executor
+	result, err := s.gateRunner.RunGateWithExecutor(gateCtx, id, gate, executor)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("gate execution failed: %v", err))
+		return
+	}
+
+	// Update evidence files
+	evts, err := s.store.ListEvents(ctx, id, 1000)
+	if err != nil {
+		log.Printf("Warning: failed to list events: %v", err)
+	}
+	if err := s.evidenceSvc.WriteEventsJSONL(id, evts); err != nil {
+		log.Printf("Failed to write events.jsonl: %v", err)
+	}
+
+	// Refresh run and write manifest
+	run, _, err = s.store.GetRun(ctx, id)
+	if err != nil {
+		log.Printf("Warning: failed to refresh run: %v", err)
+	}
+	if run != nil {
+		if err := s.evidenceSvc.WriteManifest(id, run, evts); err != nil {
+			log.Printf("Failed to write manifest: %v", err)
+		}
+	}
+
+	if !result.Passed {
+		writeJSON(w, http.StatusUnprocessableEntity, result)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handlePatchGatePolicy handles PATCH /runs/{id}/gate-policy
+func (s *Server) handlePatchGatePolicy(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	ctx := r.Context()
+	_, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	var policy contracts.GatePolicy
+	if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Update gate policy in store
+	if err := s.store.UpdateGatePolicy(ctx, id, &policy); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to update gate policy: %v", err))
+		return
+	}
+
+	// Return updated run
+	run, _, _ := s.store.GetRun(ctx, id)
+	writeJSON(w, http.StatusOK, run)
+}
+
+// handleGetPolicyDecision handles GET /runs/{id}/gate-policy/decision
+func (s *Server) handleGetPolicyDecision(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Evaluate policy
+	evaluator := gates.NewPolicyEvaluator()
+	decision := evaluator.Evaluate(run.GatePolicy, run.Gates)
+
+	writeJSON(w, http.StatusOK, decision)
+}
+
+// handleGetTrustIndex handles GET /runs/{id}/trust
+func (s *Server) handleGetTrustIndex(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Calculate trust index
+	calculator := gates.NewTrustCalculator()
+	trustIndex := calculator.Calculate(run.GatePolicy, run.Gates)
+
+	writeJSON(w, http.StatusOK, trustIndex)
 }

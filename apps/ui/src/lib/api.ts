@@ -1,4 +1,4 @@
-import type { WorkflowRun, ListRunsResponse, GateResult, SearchResponse, IndexRequest, IndexResponse } from './types';
+import type { WorkflowRun, ListRunsResponse, GateResult, SearchResponse, IndexRequest, IndexResponse, TrustIndex, PolicyDecision, GatePolicy } from './types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8090';
 
@@ -69,6 +69,22 @@ export const api = {
     return fetchJSON<IndexResponse>('/search/index', {
       method: 'POST',
       body: JSON.stringify(req),
+    });
+  },
+
+  // Trust and policy API (v0.6)
+  getTrustIndex(id: string): Promise<TrustIndex> {
+    return fetchJSON<TrustIndex>(`/runs/${id}/trust`);
+  },
+
+  getPolicyDecision(id: string): Promise<PolicyDecision> {
+    return fetchJSON<PolicyDecision>(`/runs/${id}/gate-policy/decision`);
+  },
+
+  updateGatePolicy(id: string, policy: GatePolicy): Promise<WorkflowRun> {
+    return fetchJSON<WorkflowRun>(`/runs/${id}/gate-policy`, {
+      method: 'PATCH',
+      body: JSON.stringify(policy),
     });
   },
 };

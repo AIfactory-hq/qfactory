@@ -85,6 +85,7 @@ type WorkflowRun struct {
 	Error        string             `json:"error,omitempty"`
 	Gates        []GateResult       `json:"gates,omitempty"`
 	GateHistory  []GateHistoryItem  `json:"gate_history,omitempty"`
+	GatePolicy   *GatePolicy        `json:"gate_policy,omitempty"`
 	BudgetPolicy *BudgetPolicy      `json:"budget_policy,omitempty"`
 	ModelCalls   []ModelCallSummary `json:"model_calls,omitempty"`
 }
@@ -124,6 +125,45 @@ type Check struct {
 type GateHistoryItem struct {
 	ID     string     `json:"id"`
 	Result GateResult `json:"result"`
+}
+
+// GateRef references a specific gate by level and name.
+type GateRef struct {
+	Level string `json:"level"`
+	Name  string `json:"name"`
+}
+
+// GatePolicy defines requirements for gates to pass before a run is considered complete.
+type GatePolicy struct {
+	RequiredLevels []string  `json:"required_levels,omitempty"` // e.g. ["PR1","PR2","PR3"]
+	RequiredGates  []GateRef `json:"required_gates,omitempty"`  // specific level+name pairs
+	MaxAgeSeconds  int64     `json:"max_age_seconds,omitempty"` // if >0, gates must be recent
+	MaxRetries     int       `json:"max_retries,omitempty"`     // optional retry limit
+	FailOpen       bool      `json:"fail_open,omitempty"`       // if true, missing/stale don't block
+}
+
+// PolicyDecision represents the result of evaluating a gate policy.
+type PolicyDecision struct {
+	Allowed bool      `json:"allowed"`
+	Missing []GateRef `json:"missing,omitempty"`
+	Stale   []GateRef `json:"stale,omitempty"`
+	Failing []GateRef `json:"failing,omitempty"`
+	Message string    `json:"message,omitempty"`
+}
+
+// TrustIndex represents a quality score for a workflow run.
+type TrustIndex struct {
+	Score     int            `json:"score"`     // 0-100
+	Grade     string         `json:"grade"`     // A-F
+	Breakdown TrustBreakdown `json:"breakdown"`
+}
+
+// TrustBreakdown provides detail on trust index calculation.
+type TrustBreakdown struct {
+	PassedRequired int `json:"passed_required"`
+	Failed         int `json:"failed"`
+	Stale          int `json:"stale"`
+	Missing        int `json:"missing"`
 }
 
 // GateEvidence holds raw evidence from a gate execution.

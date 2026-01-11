@@ -91,3 +91,38 @@ export interface IndexResponse {
   duration_ms: number;
   error?: string;
 }
+
+// Gate policy types (v0.6)
+export interface GateRef {
+  level: string;
+  name: string;
+}
+
+export interface GatePolicy {
+  required_levels?: string[];
+  required_gates?: GateRef[];
+  max_age_seconds?: number;
+  max_retries?: number;
+  fail_open?: boolean;
+}
+
+export interface PolicyDecision {
+  allowed: boolean;
+  missing?: GateRef[];
+  stale?: GateRef[];
+  failing?: GateRef[];
+  message?: string;
+}
+
+export interface TrustBreakdown {
+  passed_required: number;
+  failed: number;
+  stale: number;
+  missing: number;
+}
+
+export interface TrustIndex {
+  score: number;
+  grade: string;
+  breakdown: TrustBreakdown;
+}

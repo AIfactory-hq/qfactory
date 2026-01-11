@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { api } from '@/lib/api';
-import type { WorkflowRun, SSEEvent, SearchResult, GateHistoryItem } from '@/lib/types';
+import type { WorkflowRun, SSEEvent, SearchResult, GateHistoryItem, TrustIndex } from '@/lib/types';
 
 export default function RunDetailPage() {
   const params = useParams();
@@ -20,6 +20,8 @@ export default function RunDetailPage() {
   const [paused, setPaused] = useState(false);
   const [gateHistory, setGateHistory] = useState<GateHistoryItem[]>([]);
   const [showHistory, setShowHistory] = useState(false);
+  const [trustIndex, setTrustIndex] = useState<TrustIndex | null>(null);
+  const [loadingTrust, setLoadingTrust] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventsEndRef = useRef<HTMLDivElement>(null);
 
@@ -42,9 +44,22 @@ export default function RunDetailPage() {
     }
   }, [runId]);
 
+  const loadTrustIndex = useCallback(async () => {
+    setLoadingTrust(true);
+    try {
+      const data = await api.getTrustIndex(runId);
+      setTrustIndex(data);
+    } catch (err) {
+      console.error('Failed to load trust index:', err);
+    } finally {
+      setLoadingTrust(false);
+    }
+  }, [runId]);
+
   useEffect(() => {
     loadRun();
-  }, [loadRun]);
+    loadTrustIndex();
+  }, [loadRun, loadTrustIndex]);
 
   useEffect(() => {
     if (paused) return;
@@ -86,6 +101,7 @@ export default function RunDetailPage() {
     try {
       await api.runPR1Gate(runId);
       await loadRun();
+      await loadTrustIndex();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to run PR1 gate');
     } finally {
@@ -98,6 +114,7 @@ export default function RunDetailPage() {
     try {
       await api.runPR2Gate(runId);
       await loadRun();
+      await loadTrustIndex();
       if (showHistory) await loadHistory();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to run PR2 gate');
@@ -111,6 +128,7 @@ export default function RunDetailPage() {
     try {
       await api.runPR3Gate(runId);
       await loadRun();
+      await loadTrustIndex();
       if (showHistory) await loadHistory();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to run PR3 gate');
@@ -240,6 +258,68 @@ export default function RunDetailPage() {
           {error}
         </div>
       )}
+
+      {/* Trust Index Card */}
+      <div className="mb-6 card">
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-gray-900">Trust Index</h2>
+          <button
+            onClick={loadTrustIndex}
+            disabled={loadingTrust}
+            className="btn btn-secondary text-sm"
+          >
+            {loadingTrust ? 'Loading...' : 'Refresh'}
+          </button>
+        </div>
+        {trustIndex ? (
+          <div className="mt-4 flex items-center gap-8">
+            <div className="text-center">
+              <div
+                className={`text-5xl font-bold ${
+                  trustIndex.grade === 'A'
+                    ? 'text-green-600'
+                    : trustIndex.grade === 'B'
+                    ? 'text-green-500'
+                    : trustIndex.grade === 'C'
+                    ? 'text-yellow-500'
+                    : trustIndex.grade === 'D'
+                    ? 'text-orange-500'
+                    : 'text-red-500'
+                }`}
+              >
+                {trustIndex.grade}
+              </div>
+              <div className="text-gray-500 text-sm mt-1">Grade</div>
+            </div>
+            <div className="text-center">
+              <div className="text-3xl font-semibold text-gray-900">{trustIndex.score}</div>
+              <div className="text-gray-500 text-sm mt-1">Score (0-100)</div>
+            </div>
+            <div className="flex-1 grid grid-cols-4 gap-4 text-center text-sm">
+              <div>
+                <div className="text-xl font-medium text-green-600">{trustIndex.breakdown.passed_required}</div>
+                <div className="text-gray-500">Passed</div>
+              </div>
+              <div>
+                <div className="text-xl font-medium text-red-600">{trustIndex.breakdown.failed}</div>
+                <div className="text-gray-500">Failed</div>
+              </div>
+              <div>
+                <div className="text-xl font-medium text-yellow-600">{trustIndex.breakdown.stale}</div>
+                <div className="text-gray-500">Stale</div>
+              </div>
+              <div>
+                <div className="text-xl font-medium text-gray-600">{trustIndex.breakdown.missing}</div>
+                <div className="text-gray-500">Missing</div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 text-gray-500 text-sm">
+            {loadingTrust ? 'Loading trust index...' : 'No gates have been run yet.'}
+          </div>
+        )}
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Left Column: Stages and Gates */}

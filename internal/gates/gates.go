@@ -40,16 +40,18 @@ type GateOutput struct {
 
 // GateRunner manages gate execution and persistence.
 type GateRunner struct {
-	store       store.Store
-	evidenceDir string
-	publisher   EventPublisher
+	store           store.Store
+	evidenceDir     string
+	publisher       EventPublisher
+	defaultExecutor GateExecutor
 }
 
-// NewGateRunner creates a new gate runner.
+// NewGateRunner creates a new gate runner with local executor as default.
 func NewGateRunner(s store.Store, evidenceDir string) *GateRunner {
 	return &GateRunner{
-		store:       s,
-		evidenceDir: evidenceDir,
+		store:           s,
+		evidenceDir:     evidenceDir,
+		defaultExecutor: NewLocalExecutor(),
 	}
 }
 
@@ -58,8 +60,18 @@ func (r *GateRunner) SetEventPublisher(p EventPublisher) {
 	r.publisher = p
 }
 
-// RunGate executes a gate and persists the result.
+// SetDefaultExecutor sets the default gate executor.
+func (r *GateRunner) SetDefaultExecutor(executor GateExecutor) {
+	r.defaultExecutor = executor
+}
+
+// RunGate executes a gate using the default executor and persists the result.
 func (r *GateRunner) RunGate(ctx context.Context, runID string, gate Gate) (contracts.GateResult, error) {
+	return r.RunGateWithExecutor(ctx, runID, gate, r.defaultExecutor)
+}
+
+// RunGateWithExecutor executes a gate using the specified executor and persists the result.
+func (r *GateRunner) RunGateWithExecutor(ctx context.Context, runID string, gate Gate, executor GateExecutor) (contracts.GateResult, error) {
 	run, found, err := r.store.GetRun(ctx, runID)
 	if err != nil {
 		return contracts.GateResult{}, fmt.Errorf("failed to get run: %w", err)
@@ -74,20 +86,32 @@ func (r *GateRunner) RunGate(ctx context.Context, runID string, gate Gate) (cont
 		gateName = "default"
 	}
 
+	// Determine executor name
+	executorName := "local"
+	if executor != nil {
+		executorName = executor.Name()
+	}
+
 	// Generate unique execution ID for history
 	executionID := events.NewID()
 	startTime := time.Now().UTC()
 
 	// Emit gate.started event
 	if r.publisher != nil {
-		startEvent := events.NewGateStartedEvent(runID, gate.Level(), gateName, "local", startTime)
+		startEvent := events.NewGateStartedEvent(runID, gate.Level(), gateName, executorName, startTime)
 		if err := r.publisher.PublishEvent(ctx, startEvent); err != nil {
 			fmt.Printf("Warning: failed to publish gate.started event: %v\n", err)
 		}
 	}
 
-	// Execute gate
-	output, runErr := gate.Run(ctx, run)
+	// Execute gate using executor
+	var output GateOutput
+	var runErr error
+	if executor != nil {
+		output, runErr = executor.Execute(ctx, run, gate)
+	} else {
+		output, runErr = gate.Run(ctx, run)
+	}
 	endTime := time.Now().UTC()
 	durationMs := endTime.Sub(startTime).Milliseconds()
 
@@ -98,7 +122,7 @@ func (r *GateRunner) RunGate(ctx context.Context, runID string, gate Gate) (cont
 				Level:       gate.Level(),
 				Name:        gateName,
 				Passed:      false,
-				Executor:    "local",
+				Executor:    executorName,
 				Timestamp:   endTime,
 				StartedAt:   &startTime,
 				CompletedAt: &endTime,
@@ -108,9 +132,12 @@ func (r *GateRunner) RunGate(ctx context.Context, runID string, gate Gate) (cont
 					{Name: "gate_execution", Passed: false, Message: runErr.Error()},
 				},
 			},
-			Command: "",
-			Stdout:  "",
-			Stderr:  runErr.Error(),
+			Command: output.Command,
+			Stdout:  output.Stdout,
+			Stderr:  output.Stderr,
+		}
+		if failOutput.Stderr == "" {
+			failOutput.Stderr = runErr.Error()
 		}
 
 		// Write evidence even on failure
@@ -125,7 +152,7 @@ func (r *GateRunner) RunGate(ctx context.Context, runID string, gate Gate) (cont
 
 		// Emit gate.failed event
 		if r.publisher != nil {
-			failEvent := events.NewGateFailedEvent(runID, gate.Level(), gateName, "local", runErr.Error(), startTime, durationMs)
+			failEvent := events.NewGateFailedEvent(runID, gate.Level(), gateName, executorName, runErr.Error(), startTime, durationMs)
 			if err := r.publisher.PublishEvent(ctx, failEvent); err != nil {
 				fmt.Printf("Warning: failed to publish gate.failed event: %v\n", err)
 			}
@@ -134,8 +161,11 @@ func (r *GateRunner) RunGate(ctx context.Context, runID string, gate Gate) (cont
 		return failOutput.Result, fmt.Errorf("gate execution failed: %w", runErr)
 	}
 
-	// Normalize name in output result
+	// Normalize name and executor in output result
 	output.Result.Name = gateName
+	if output.Result.Executor == "" {
+		output.Result.Executor = executorName
+	}
 
 	// Write all evidence files
 	evidencePath, writeErr := r.writeGateEvidence(runID, gate.Level(), gateName, output)

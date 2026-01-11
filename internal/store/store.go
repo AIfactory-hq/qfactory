@@ -49,6 +49,12 @@ type Store interface {
 	// GetBudgetStatus retrieves the budget status for a run.
 	GetBudgetStatus(ctx context.Context, runID string) (*contracts.BudgetStatus, error)
 
+	// UpdateGatePolicy updates the gate policy for a run.
+	UpdateGatePolicy(ctx context.Context, runID string, policy *contracts.GatePolicy) error
+
+	// GetGatePolicy retrieves the gate policy for a run.
+	GetGatePolicy(ctx context.Context, runID string) (*contracts.GatePolicy, error)
+
 	// Close releases any resources held by the store.
 	Close() error
 }

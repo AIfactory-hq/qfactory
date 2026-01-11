@@ -16,6 +16,12 @@ func NewPolicyEvaluator() *PolicyEvaluator {
 
 // Evaluate checks if the gate results satisfy the policy.
 func (e *PolicyEvaluator) Evaluate(policy *contracts.GatePolicy, gates []contracts.GateResult) contracts.PolicyDecision {
+	return e.EvaluateWithHistory(policy, gates, nil)
+}
+
+// EvaluateWithHistory checks if the gate results satisfy the policy.
+// When RequireAllPassed is set, it checks the entire gate history to ensure no failures.
+func (e *PolicyEvaluator) EvaluateWithHistory(policy *contracts.GatePolicy, gates []contracts.GateResult, history []contracts.GateHistoryItem) contracts.PolicyDecision {
 	if policy == nil {
 		// No policy means all gates are allowed
 		return contracts.PolicyDecision{
@@ -77,6 +83,20 @@ func (e *PolicyEvaluator) Evaluate(policy *contracts.GatePolicy, gates []contrac
 		}
 	}
 
+	// v1.0: RequireAllPassed - check entire gate history for any failures
+	if policy.RequireAllPassed && len(history) > 0 {
+		failedGates := findHistoricalFailures(history, policy)
+		for _, ref := range failedGates {
+			// Add to failing list if not already there
+			if !containsRef(decision.Failing, ref) {
+				decision.Failing = append(decision.Failing, ref)
+			}
+		}
+		if len(failedGates) > 0 {
+			decision.Allowed = false
+		}
+	}
+
 	// Apply fail_open semantics
 	if !decision.Allowed && policy.FailOpen {
 		decision.Allowed = true
@@ -88,6 +108,56 @@ func (e *PolicyEvaluator) Evaluate(policy *contracts.GatePolicy, gates []contrac
 	}
 
 	return decision
+}
+
+// findHistoricalFailures finds any gate failures in history for required gates.
+func findHistoricalFailures(history []contracts.GateHistoryItem, policy *contracts.GatePolicy) []contracts.GateRef {
+	var failures []contracts.GateRef
+
+	for _, item := range history {
+		if !item.Result.Passed {
+			// Check if this gate level is required
+			isRequired := false
+			for _, level := range policy.RequiredLevels {
+				if item.Result.Level == level {
+					isRequired = true
+					break
+				}
+			}
+			// Check if this specific gate is required
+			if !isRequired {
+				for _, gateRef := range policy.RequiredGates {
+					name := contracts.NormalizeGateName(item.Result.Name)
+					if item.Result.Level == gateRef.Level && name == gateRef.Name {
+						isRequired = true
+						break
+					}
+				}
+			}
+
+			if isRequired {
+				ref := contracts.GateRef{
+					Level: item.Result.Level,
+					Name:  contracts.NormalizeGateName(item.Result.Name),
+				}
+				if !containsRef(failures, ref) {
+					failures = append(failures, ref)
+				}
+			}
+		}
+	}
+
+	return failures
+}
+
+// containsRef checks if a GateRef slice contains a specific ref.
+func containsRef(refs []contracts.GateRef, ref contracts.GateRef) bool {
+	for _, r := range refs {
+		if r.Level == ref.Level && r.Name == ref.Name {
+			return true
+		}
+	}
+	return false
 }
 
 // buildGateMap creates a map[level][name]GateResult for fast lookups.

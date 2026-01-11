@@ -63,6 +63,106 @@ const (
 // DefaultTrustThreshold is the minimum trust score required for finalization.
 const DefaultTrustThreshold = 80
 
+// v1.0: RBAC Roles
+type Role string
+
+const (
+	RoleViewer   Role = "viewer"   // read runs, gates, evidence, capsules
+	RoleOperator Role = "operator" // run gates (PR1-PR3)
+	RoleApprover Role = "approver" // finalize runs
+	RoleAdmin    Role = "admin"    // override trust + manage policies
+)
+
+// ValidRoles contains all valid roles.
+var ValidRoles = []Role{RoleViewer, RoleOperator, RoleApprover, RoleAdmin}
+
+// IsValidRole checks if a role string is valid.
+func IsValidRole(r string) bool {
+	for _, valid := range ValidRoles {
+		if string(valid) == r {
+			return true
+		}
+	}
+	return false
+}
+
+// RoleHasPermission checks if a role has a specific permission.
+func RoleHasPermission(role Role, permission Permission) bool {
+	perms, ok := RolePermissions[role]
+	if !ok {
+		return false
+	}
+	for _, p := range perms {
+		if p == permission {
+			return true
+		}
+	}
+	return false
+}
+
+// Permission represents an action that can be performed.
+type Permission string
+
+const (
+	PermissionRead        Permission = "read"
+	PermissionRunGates    Permission = "run_gates"
+	PermissionFinalize    Permission = "finalize"
+	PermissionOverride    Permission = "override"
+	PermissionManagePolicy Permission = "manage_policy"
+)
+
+// RolePermissions maps roles to their permissions.
+var RolePermissions = map[Role][]Permission{
+	RoleViewer:   {PermissionRead},
+	RoleOperator: {PermissionRead, PermissionRunGates},
+	RoleApprover: {PermissionRead, PermissionRunGates, PermissionFinalize},
+	RoleAdmin:    {PermissionRead, PermissionRunGates, PermissionFinalize, PermissionOverride, PermissionManagePolicy},
+}
+
+// v1.0: Structured Error Codes
+type ErrorCode string
+
+const (
+	ErrCodeForbiddenRole     ErrorCode = "ERR_FORBIDDEN_ROLE"
+	ErrCodePolicyViolation   ErrorCode = "ERR_POLICY_VIOLATION"
+	ErrCodeAlreadyFinalized  ErrorCode = "ERR_ALREADY_FINALIZED"
+	ErrCodeTenantMismatch    ErrorCode = "ERR_TENANT_MISMATCH"
+	ErrCodeGatesRunning      ErrorCode = "ERR_GATES_RUNNING"
+	ErrCodeLimitExceeded     ErrorCode = "ERR_LIMIT_EXCEEDED"
+	ErrCodeInvalidRequest    ErrorCode = "ERR_INVALID_REQUEST"
+)
+
+// APIError represents a structured API error response.
+type APIError struct {
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
+	Details string    `json:"details,omitempty"`
+}
+
+// v1.0: Operational Limits
+type OperationalLimits struct {
+	MaxGateRuntimeSeconds int   `json:"max_gate_runtime_seconds"` // default 600 (10 min)
+	MaxRetriesPerGate     int   `json:"max_retries_per_gate"`     // default 3
+	MaxCapsuleSizeBytes   int64 `json:"max_capsule_size_bytes"`   // default 100MB
+}
+
+// DefaultOperationalLimits returns safe defaults.
+func DefaultOperationalLimits() OperationalLimits {
+	return OperationalLimits{
+		MaxGateRuntimeSeconds: 600,
+		MaxRetriesPerGate:     3,
+		MaxCapsuleSizeBytes:   100 * 1024 * 1024, // 100MB
+	}
+}
+
+// v1.0: Request Context carries tenant/role info
+type RequestContext struct {
+	TenantID  string `json:"tenant_id"`
+	ProjectID string `json:"project_id"`
+	Role      Role   `json:"role"`
+	UserID    string `json:"user_id,omitempty"`
+}
+
 // StageState represents the state of a workflow stage.
 type StageState string
 
@@ -115,15 +215,22 @@ type WorkflowRun struct {
 	GatePolicy   *GatePolicy        `json:"gate_policy,omitempty"`
 	BudgetPolicy *BudgetPolicy      `json:"budget_policy,omitempty"`
 	ModelCalls   []ModelCallSummary `json:"model_calls,omitempty"`
+	// Tenancy fields (v1.0)
+	TenantID  string `json:"tenant_id,omitempty"`
+	ProjectID string `json:"project_id,omitempty"`
+	// Policy tracking (v1.0)
+	PolicyDecision *PolicyDecision `json:"policy_decision,omitempty"`
+	PolicySnapshot *GatePolicy     `json:"policy_snapshot,omitempty"`
+	GatesRunning   bool            `json:"gates_running,omitempty"`
 	// Finalization fields (v0.9)
-	FinalizedAt           *time.Time `json:"finalized_at,omitempty"`
-	FinalizedBy           string     `json:"finalized_by,omitempty"`
-	FinalizeReason        string     `json:"finalize_reason,omitempty"`
-	FinalizeOverride      bool       `json:"finalize_override,omitempty"`
-	FinalizeOverrideReason string    `json:"finalize_override_reason,omitempty"`
-	CapsuleID             string     `json:"capsule_id,omitempty"`
-	CapsulePath           string     `json:"capsule_path,omitempty"`
-	CapsuleManifestSHA256 string     `json:"capsule_manifest_sha256,omitempty"`
+	FinalizedAt            *time.Time `json:"finalized_at,omitempty"`
+	FinalizedBy            string     `json:"finalized_by,omitempty"`
+	FinalizeReason         string     `json:"finalize_reason,omitempty"`
+	FinalizeOverride       bool       `json:"finalize_override,omitempty"`
+	FinalizeOverrideReason string     `json:"finalize_override_reason,omitempty"`
+	CapsuleID              string     `json:"capsule_id,omitempty"`
+	CapsulePath            string     `json:"capsule_path,omitempty"`
+	CapsuleManifestSHA256  string     `json:"capsule_manifest_sha256,omitempty"`
 }
 
 // IsFinalized returns true if the run has been finalized.
@@ -179,11 +286,15 @@ type GateRef struct {
 
 // GatePolicy defines requirements for gates to pass before a run is considered complete.
 type GatePolicy struct {
-	RequiredLevels []string  `json:"required_levels,omitempty"` // e.g. ["PR1","PR2","PR3"]
-	RequiredGates  []GateRef `json:"required_gates,omitempty"`  // specific level+name pairs
-	MaxAgeSeconds  int64     `json:"max_age_seconds,omitempty"` // if >0, gates must be recent
-	MaxRetries     int       `json:"max_retries,omitempty"`     // optional retry limit
-	FailOpen       bool      `json:"fail_open,omitempty"`       // if true, missing/stale don't block
+	RequiredLevels    []string  `json:"required_levels,omitempty"`    // e.g. ["PR1","PR2","PR3"]
+	RequiredGates     []GateRef `json:"required_gates,omitempty"`     // specific level+name pairs
+	MaxAgeSeconds     int64     `json:"max_age_seconds,omitempty"`    // if >0, gates must be recent
+	MaxRetries        int       `json:"max_retries,omitempty"`        // optional retry limit
+	FailOpen          bool      `json:"fail_open,omitempty"`          // if true, missing/stale don't block
+	// v1.0 policy hardening fields
+	MinTrustScore     int  `json:"min_trust_score,omitempty"`     // minimum trust score for finalization (default 80)
+	AllowOverride     bool `json:"allow_override,omitempty"`      // allow admin override of trust score
+	RequireAllPassed  bool `json:"require_all_passed,omitempty"`  // all required gates must pass (not just latest)
 }
 
 // PolicyDecision represents the result of evaluating a gate policy.

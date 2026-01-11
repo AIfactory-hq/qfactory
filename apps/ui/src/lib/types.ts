@@ -46,6 +46,10 @@ export interface WorkflowRun {
   error?: string;
   gates?: GateResult[];
   gate_history?: GateHistoryItem[];
+  // Tenancy fields (v1.0)
+  tenant_id?: string;
+  project_id?: string;
+  gates_running?: boolean;
   // Finalization fields (v0.9)
   finalized_at?: string;
   finalized_by?: string;
@@ -116,6 +120,10 @@ export interface GatePolicy {
   max_age_seconds?: number;
   max_retries?: number;
   fail_open?: boolean;
+  // v1.0 policy hardening fields
+  min_trust_score?: number;
+  allow_override?: boolean;
+  require_all_passed?: boolean;
 }
 
 export interface PolicyDecision {
@@ -224,4 +232,33 @@ export interface CapsuleVerifyResult {
   manifest_sha256?: string;
   public_key_fingerprint?: string;
   files_verified?: number;
+}
+
+// v1.0 RBAC types
+export type Role = 'viewer' | 'operator' | 'approver' | 'admin';
+
+export type Permission = 'read' | 'run_gates' | 'finalize' | 'override' | 'manage_policy';
+
+export const RolePermissions: Record<Role, Permission[]> = {
+  viewer: ['read'],
+  operator: ['read', 'run_gates'],
+  approver: ['read', 'run_gates', 'finalize'],
+  admin: ['read', 'run_gates', 'finalize', 'override', 'manage_policy'],
+};
+
+export function hasPermission(role: Role, permission: Permission): boolean {
+  return RolePermissions[role]?.includes(permission) ?? false;
+}
+
+export interface APIError {
+  code: string;
+  message: string;
+  details?: string;
+}
+
+export interface RequestContext {
+  tenant_id?: string;
+  project_id?: string;
+  role?: Role;
+  user_id?: string;
 }

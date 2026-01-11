@@ -277,7 +277,7 @@ export default function RunDetailPage() {
           &larr; Back to runs
         </Link>
         <h1 className="text-2xl font-bold text-gray-900 mt-2 font-mono">{runId}</h1>
-        <div className="flex items-center gap-4 mt-2">
+        <div className="flex items-center gap-4 mt-2 flex-wrap">
           <span
             className={`badge ${
               run?.status === 'finalized'
@@ -293,9 +293,25 @@ export default function RunDetailPage() {
           >
             {run?.status}
           </span>
+          {run?.gates_running && (
+            <span className="text-xs bg-yellow-100 text-yellow-800 px-2 py-0.5 rounded animate-pulse">
+              Gates Running
+            </span>
+          )}
           {run?.status === 'finalized' && run?.capsule_id && (
             <span className="text-xs bg-purple-100 text-purple-800 px-2 py-0.5 rounded font-mono">
               Capsule: {run.capsule_id.substring(0, 12)}...
+            </span>
+          )}
+          {/* v1.0: Tenant/Project badges */}
+          {run?.tenant_id && run.tenant_id !== 'default' && (
+            <span className="text-xs bg-indigo-100 text-indigo-800 px-2 py-0.5 rounded">
+              Tenant: {run.tenant_id}
+            </span>
+          )}
+          {run?.project_id && run.project_id !== 'default' && (
+            <span className="text-xs bg-cyan-100 text-cyan-800 px-2 py-0.5 rounded">
+              Project: {run.project_id}
             </span>
           )}
           {run?.temporal_id && (
@@ -511,10 +527,11 @@ export default function RunDetailPage() {
 
             <button
               onClick={handleFinalize}
-              disabled={finalizing || (override && !overrideReason.trim())}
+              disabled={finalizing || (override && !overrideReason.trim()) || run?.gates_running}
               className="btn btn-primary"
+              title={run?.gates_running ? 'Cannot finalize while gates are running' : ''}
             >
-              {finalizing ? 'Finalizing...' : 'Finalize Run'}
+              {finalizing ? 'Finalizing...' : run?.gates_running ? 'Gates Running...' : 'Finalize Run'}
             </button>
           </div>
         ) : (

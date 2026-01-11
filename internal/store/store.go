@@ -70,6 +70,17 @@ type Store interface {
 	// IsRunFinalized checks if a run is finalized.
 	IsRunFinalized(ctx context.Context, runID string) (bool, error)
 
+	// v1.0: Tenant isolation methods
+
+	// ListRunsByTenant returns runs filtered by tenant/project, ordered by updated_at desc.
+	ListRunsByTenant(ctx context.Context, tenantID, projectID string, limit int) ([]*contracts.WorkflowRun, error)
+
+	// SetGatesRunning sets the gates_running flag on a run (for finalization safety).
+	SetGatesRunning(ctx context.Context, runID string, running bool) error
+
+	// UpdatePolicyDecision updates policy decision and snapshots the policy at evaluation time.
+	UpdatePolicyDecision(ctx context.Context, runID string, decision *contracts.PolicyDecision, snapshot *contracts.GatePolicy) error
+
 	// Close releases any resources held by the store.
 	Close() error
 }

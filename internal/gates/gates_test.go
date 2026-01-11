@@ -154,6 +154,35 @@ func (m *mockStore) IsRunFinalized(ctx context.Context, runID string) (bool, err
 	return run.IsFinalized(), nil
 }
 
+func (m *mockStore) ListRunsByTenant(ctx context.Context, tenantID, projectID string, limit int) ([]*contracts.WorkflowRun, error) {
+	var runs []*contracts.WorkflowRun
+	for _, run := range m.runs {
+		if (tenantID == "" || run.TenantID == tenantID) && (projectID == "" || run.ProjectID == projectID) {
+			runs = append(runs, run)
+		}
+	}
+	return runs, nil
+}
+
+func (m *mockStore) SetGatesRunning(ctx context.Context, runID string, running bool) error {
+	run, ok := m.runs[runID]
+	if !ok {
+		return nil
+	}
+	run.GatesRunning = running
+	return nil
+}
+
+func (m *mockStore) UpdatePolicyDecision(ctx context.Context, runID string, decision *contracts.PolicyDecision, snapshot *contracts.GatePolicy) error {
+	run, ok := m.runs[runID]
+	if !ok {
+		return nil
+	}
+	run.PolicyDecision = decision
+	run.PolicySnapshot = snapshot
+	return nil
+}
+
 // mockEventPublisher implements EventPublisher for testing.
 type mockEventPublisher struct {
 	events []events.Event
@@ -1182,5 +1211,135 @@ func TestGateRunner_SetRegistry(t *testing.T) {
 	// GetRegistry should return the custom registry
 	if runner.GetRegistry() != customRegistry {
 		t.Error("SetRegistry should set the registry")
+	}
+}
+
+// v1.0 RBAC and Policy tests
+
+func TestRoleHasPermission(t *testing.T) {
+	tests := []struct {
+		role       contracts.Role
+		permission contracts.Permission
+		expected   bool
+	}{
+		{contracts.RoleViewer, contracts.PermissionRead, true},
+		{contracts.RoleViewer, contracts.PermissionRunGates, false},
+		{contracts.RoleViewer, contracts.PermissionFinalize, false},
+		{contracts.RoleOperator, contracts.PermissionRead, true},
+		{contracts.RoleOperator, contracts.PermissionRunGates, true},
+		{contracts.RoleOperator, contracts.PermissionFinalize, false},
+		{contracts.RoleApprover, contracts.PermissionFinalize, true},
+		{contracts.RoleApprover, contracts.PermissionOverride, false},
+		{contracts.RoleAdmin, contracts.PermissionRead, true},
+		{contracts.RoleAdmin, contracts.PermissionRunGates, true},
+		{contracts.RoleAdmin, contracts.PermissionFinalize, true},
+		{contracts.RoleAdmin, contracts.PermissionOverride, true},
+		{contracts.RoleAdmin, contracts.PermissionManagePolicy, true},
+	}
+
+	for _, tc := range tests {
+		result := contracts.RoleHasPermission(tc.role, tc.permission)
+		if result != tc.expected {
+			t.Errorf("RoleHasPermission(%s, %s) = %v, expected %v", tc.role, tc.permission, result, tc.expected)
+		}
+	}
+}
+
+func TestPolicyEvaluator_RequireAllPassed_NoHistoricalFailures(t *testing.T) {
+	evaluator := NewPolicyEvaluator()
+
+	policy := &contracts.GatePolicy{
+		RequiredLevels:   []string{"PR1"},
+		RequireAllPassed: true,
+	}
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now},
+	}
+
+	// History with only passing gates
+	history := []contracts.GateHistoryItem{
+		{ID: "h1", Result: contracts.GateResult{Level: "PR1", Name: "unit_tests", Passed: true}},
+	}
+
+	decision := evaluator.EvaluateWithHistory(policy, gates, history)
+
+	if !decision.Allowed {
+		t.Error("expected decision to be allowed when all historical gates passed")
+	}
+}
+
+func TestPolicyEvaluator_RequireAllPassed_WithHistoricalFailures(t *testing.T) {
+	evaluator := NewPolicyEvaluator()
+
+	policy := &contracts.GatePolicy{
+		RequiredLevels:   []string{"PR1"},
+		RequireAllPassed: true,
+	}
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now}, // Latest passes
+	}
+
+	// History with a previous failure
+	history := []contracts.GateHistoryItem{
+		{ID: "h2", Result: contracts.GateResult{Level: "PR1", Name: "unit_tests", Passed: true}},
+		{ID: "h1", Result: contracts.GateResult{Level: "PR1", Name: "unit_tests", Passed: false}}, // Previous failure
+	}
+
+	decision := evaluator.EvaluateWithHistory(policy, gates, history)
+
+	if decision.Allowed {
+		t.Error("expected decision to be denied when RequireAllPassed and historical failure exists")
+	}
+	if len(decision.Failing) == 0 {
+		t.Error("expected failing gates to be reported")
+	}
+}
+
+func TestPolicyEvaluator_ExtendedPolicy_MinTrustScore(t *testing.T) {
+	policy := &contracts.GatePolicy{
+		RequiredLevels: []string{"PR1"},
+		MinTrustScore:  85,
+		AllowOverride:  true,
+	}
+
+	if policy.MinTrustScore != 85 {
+		t.Errorf("expected MinTrustScore 85, got %d", policy.MinTrustScore)
+	}
+	if !policy.AllowOverride {
+		t.Error("expected AllowOverride to be true")
+	}
+}
+
+func TestDefaultOperationalLimits(t *testing.T) {
+	limits := contracts.DefaultOperationalLimits()
+
+	if limits.MaxGateRuntimeSeconds != 600 {
+		t.Errorf("expected MaxGateRuntimeSeconds 600, got %d", limits.MaxGateRuntimeSeconds)
+	}
+	if limits.MaxRetriesPerGate != 3 {
+		t.Errorf("expected MaxRetriesPerGate 3, got %d", limits.MaxRetriesPerGate)
+	}
+	expectedSize := int64(100 * 1024 * 1024) // 100MB
+	if limits.MaxCapsuleSizeBytes != expectedSize {
+		t.Errorf("expected MaxCapsuleSizeBytes %d, got %d", expectedSize, limits.MaxCapsuleSizeBytes)
+	}
+}
+
+func TestAPIError(t *testing.T) {
+	err := contracts.APIError{
+		Code:    contracts.ErrCodeForbiddenRole,
+		Message: "role 'viewer' does not have permission 'run_gates'",
+		Details: "required_permission=run_gates",
+	}
+
+	if err.Code != contracts.ErrCodeForbiddenRole {
+		t.Errorf("expected code %s, got %s", contracts.ErrCodeForbiddenRole, err.Code)
+	}
+	if err.Message == "" {
+		t.Error("expected non-empty message")
 	}
 }

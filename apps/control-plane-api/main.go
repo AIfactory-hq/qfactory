@@ -124,6 +124,7 @@ func main() {
 		gateRunner:      gateRunner,
 		capsuleSigner:   capsuleSigner,
 		capsuleExporter: capsuleExporter,
+		opLimits:        contracts.DefaultOperationalLimits(), // v1.0
 	}
 
 	// Wire up gate runner with event publisher
@@ -180,16 +181,17 @@ func main() {
 
 // Server holds dependencies for HTTP handlers.
 type Server struct {
-	store          store.Store
-	sseHub         *store.SSEHub
-	temporal       client.Client
-	evidenceSvc    *EvidenceService
-	searchSvc      *SearchService
-	modelRuntime   modelruntime.Runtime
-	budgetMgr      *modelruntime.BudgetManager
-	gateRunner     *gates.GateRunner
-	capsuleSigner  *capsules.Signer   // v0.9
-	capsuleExporter *capsules.Exporter // v0.9
+	store           store.Store
+	sseHub          *store.SSEHub
+	temporal        client.Client
+	evidenceSvc     *EvidenceService
+	searchSvc       *SearchService
+	modelRuntime    modelruntime.Runtime
+	budgetMgr       *modelruntime.BudgetManager
+	gateRunner      *gates.GateRunner
+	capsuleSigner   *capsules.Signer            // v0.9
+	capsuleExporter *capsules.Exporter          // v0.9
+	opLimits        contracts.OperationalLimits // v1.0
 }
 
 // writeJSON writes a JSON response with the given status code.
@@ -208,7 +210,81 @@ func writeJSONError(w http.ResponseWriter, code int, msg string) {
 // Writes 409 Conflict if the run is finalized.
 func checkNotFinalized(w http.ResponseWriter, run *contracts.WorkflowRun) bool {
 	if run.IsFinalized() {
-		writeJSONError(w, http.StatusConflict, "run is finalized and cannot be modified")
+		writeAPIError(w, http.StatusConflict, contracts.ErrCodeAlreadyFinalized, "run is finalized and cannot be modified", "")
+		return true
+	}
+	return false
+}
+
+// writeAPIError writes a structured API error response (v1.0).
+func writeAPIError(w http.ResponseWriter, httpCode int, code contracts.ErrorCode, message, details string) {
+	writeJSON(w, httpCode, contracts.APIError{
+		Code:    code,
+		Message: message,
+		Details: details,
+	})
+}
+
+// v1.0: RBAC middleware helpers
+
+// extractRequestContext extracts tenant/role info from request headers.
+// Headers: X-Tenant-ID, X-Project-ID, X-Role, X-User-ID
+func extractRequestContext(r *http.Request) contracts.RequestContext {
+	return contracts.RequestContext{
+		TenantID:  r.Header.Get("X-Tenant-ID"),
+		ProjectID: r.Header.Get("X-Project-ID"),
+		Role:      contracts.Role(r.Header.Get("X-Role")),
+		UserID:    r.Header.Get("X-User-ID"),
+	}
+}
+
+// checkPermission returns true if the handler should abort (insufficient permission).
+// Writes 403 Forbidden with structured error if permission denied.
+func checkPermission(w http.ResponseWriter, reqCtx contracts.RequestContext, required contracts.Permission) bool {
+	// Default role is viewer if not specified
+	role := reqCtx.Role
+	if role == "" {
+		role = contracts.RoleViewer
+	}
+
+	if !contracts.RoleHasPermission(role, required) {
+		writeAPIError(w, http.StatusForbidden, contracts.ErrCodeForbiddenRole,
+			fmt.Sprintf("role '%s' does not have permission '%s'", role, required),
+			fmt.Sprintf("required_permission=%s", required))
+		return true
+	}
+	return false
+}
+
+// checkTenantAccess returns true if the handler should abort (tenant mismatch).
+// Writes 403 Forbidden with structured error if tenant doesn't match.
+func checkTenantAccess(w http.ResponseWriter, reqCtx contracts.RequestContext, run *contracts.WorkflowRun) bool {
+	// Skip check if request has no tenant specified (backward compat)
+	if reqCtx.TenantID == "" {
+		return false
+	}
+
+	// Skip check if run has no tenant (legacy runs)
+	if run.TenantID == "" {
+		return false
+	}
+
+	if reqCtx.TenantID != run.TenantID {
+		writeAPIError(w, http.StatusForbidden, contracts.ErrCodeTenantMismatch,
+			"access denied: tenant mismatch",
+			fmt.Sprintf("request_tenant=%s, run_tenant=%s", reqCtx.TenantID, run.TenantID))
+		return true
+	}
+	return false
+}
+
+// checkGatesNotRunning returns true if the handler should abort (gates are running).
+// Writes 409 Conflict with structured error if gates are running.
+func checkGatesNotRunning(w http.ResponseWriter, run *contracts.WorkflowRun) bool {
+	if run.GatesRunning {
+		writeAPIError(w, http.StatusConflict, contracts.ErrCodeGatesRunning,
+			"cannot proceed: gates are currently running",
+			"wait for gates to complete before retrying")
 		return true
 	}
 	return false
@@ -1647,6 +1723,15 @@ func (s *Server) handleRunGate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// v1.0: RBAC check - require run_gates permission
+	reqCtx := extractRequestContext(r)
+	if checkPermission(w, reqCtx, contracts.PermissionRunGates) {
+		return
+	}
+	if checkTenantAccess(w, reqCtx, run) {
+		return
+	}
+
 	// Reject if run is not completed
 	if run.Status != contracts.RunStatusCompleted {
 		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to run gate (current status: %s)", run.Status))
@@ -1688,13 +1773,24 @@ func (s *Server) handleRunGate(w http.ResponseWriter, r *http.Request) {
 		executor = gates.NewLocalExecutor()
 	}
 
-	// Set up context with timeout
-	timeoutSeconds := 300 // default 5 minutes
-	if req.TimeoutSeconds > 0 {
+	// Set up context with timeout (v1.0: use operational limits)
+	timeoutSeconds := s.opLimits.MaxGateRuntimeSeconds
+	if req.TimeoutSeconds > 0 && req.TimeoutSeconds < timeoutSeconds {
+		// Allow shorter timeouts, but not longer than the limit
 		timeoutSeconds = req.TimeoutSeconds
 	}
 	gateCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
+
+	// v1.0: Set gates_running flag for finalization safety
+	if err := s.store.SetGatesRunning(ctx, id, true); err != nil {
+		log.Printf("Warning: failed to set gates_running: %v", err)
+	}
+	defer func() {
+		if err := s.store.SetGatesRunning(ctx, id, false); err != nil {
+			log.Printf("Warning: failed to clear gates_running: %v", err)
+		}
+	}()
 
 	// Execute gate with executor
 	result, err := s.gateRunner.RunGateWithExecutor(gateCtx, id, gate, executor)
@@ -1758,6 +1854,15 @@ func (s *Server) handlePatchGatePolicy(w http.ResponseWriter, r *http.Request) {
 
 	// Reject if finalized (v0.9)
 	if checkNotFinalized(w, run) {
+		return
+	}
+
+	// v1.0: RBAC check - require manage_policy permission (admin only)
+	reqCtx := extractRequestContext(r)
+	if checkPermission(w, reqCtx, contracts.PermissionManagePolicy) {
+		return
+	}
+	if checkTenantAccess(w, reqCtx, run) {
 		return
 	}
 
@@ -1886,6 +1991,15 @@ func (s *Server) handleRetryGate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// v1.0: RBAC check - require run_gates permission
+	reqCtx := extractRequestContext(r)
+	if checkPermission(w, reqCtx, contracts.PermissionRunGates) {
+		return
+	}
+	if checkTenantAccess(w, reqCtx, run) {
+		return
+	}
+
 	// Reject if run is not completed
 	if run.Status != contracts.RunStatusCompleted {
 		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to retry gate (current status: %s)", run.Status))
@@ -1904,13 +2018,46 @@ func (s *Server) handleRetryGate(w http.ResponseWriter, r *http.Request) {
 	// Normalize gate name
 	name = contracts.NormalizeGateName(name)
 
-	// Set up context with timeout
-	timeoutSeconds := 300 // default 5 minutes
-	if req.TimeoutSeconds > 0 {
+	// v1.0: Check retry limit
+	history, _ := s.store.ListGateHistory(ctx, id, 100)
+	retryCount := 0
+	for _, item := range history {
+		itemName := contracts.NormalizeGateName(item.Result.Name)
+		if item.Result.Level == level && itemName == name {
+			retryCount++
+		}
+	}
+
+	// Get max retries from policy or operational limits
+	maxRetries := s.opLimits.MaxRetriesPerGate
+	if run.GatePolicy != nil && run.GatePolicy.MaxRetries > 0 {
+		maxRetries = run.GatePolicy.MaxRetries
+	}
+
+	if retryCount >= maxRetries {
+		writeAPIError(w, http.StatusTooManyRequests, contracts.ErrCodeLimitExceeded,
+			fmt.Sprintf("retry limit exceeded: %d retries for gate %s/%s", retryCount, level, name),
+			fmt.Sprintf("max_retries=%d", maxRetries))
+		return
+	}
+
+	// Set up context with timeout (v1.0: use operational limits)
+	timeoutSeconds := s.opLimits.MaxGateRuntimeSeconds
+	if req.TimeoutSeconds > 0 && req.TimeoutSeconds < timeoutSeconds {
 		timeoutSeconds = req.TimeoutSeconds
 	}
 	gateCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
+
+	// v1.0: Set gates_running flag for finalization safety
+	if err := s.store.SetGatesRunning(ctx, id, true); err != nil {
+		log.Printf("Warning: failed to set gates_running: %v", err)
+	}
+	defer func() {
+		if err := s.store.SetGatesRunning(ctx, id, false); err != nil {
+			log.Printf("Warning: failed to clear gates_running: %v", err)
+		}
+	}()
 
 	// Execute retry using GateRunner
 	result, err := s.gateRunner.RetryGate(gateCtx, id, level, name, req.Reason)
@@ -2275,9 +2422,23 @@ func (s *Server) handleFinalizeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// v1.0: RBAC check - require finalize permission
+	reqCtx := extractRequestContext(r)
+	if checkPermission(w, reqCtx, contracts.PermissionFinalize) {
+		return
+	}
+	if checkTenantAccess(w, reqCtx, run) {
+		return
+	}
+
 	// Must be completed to finalize
 	if run.Status != contracts.RunStatusCompleted {
 		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to finalize (current status: %s)", run.Status))
+		return
+	}
+
+	// v1.0: Check if gates are currently running
+	if checkGatesNotRunning(w, run) {
 		return
 	}
 
@@ -2297,15 +2458,31 @@ func (s *Server) handleFinalizeRun(w http.ResponseWriter, r *http.Request) {
 	calculator := gates.NewTrustCalculator()
 	trustIndex := calculator.CalculateWithHistory(run.GatePolicy, run.Gates, history)
 
-	// Check trust threshold
+	// Check trust threshold (v1.0: use policy's MinTrustScore if set)
 	threshold := req.TrustThreshold
 	if threshold == 0 {
-		threshold = contracts.DefaultTrustThreshold
+		if run.GatePolicy != nil && run.GatePolicy.MinTrustScore > 0 {
+			threshold = run.GatePolicy.MinTrustScore
+		} else {
+			threshold = contracts.DefaultTrustThreshold
+		}
+	}
+
+	// v1.0: Check policy AllowOverride flag
+	allowOverride := true
+	if run.GatePolicy != nil {
+		allowOverride = run.GatePolicy.AllowOverride
 	}
 
 	if trustIndex.Score < threshold && !req.Override {
-		writeJSONError(w, http.StatusUnprocessableEntity,
-			fmt.Sprintf("trust score %d is below threshold %d; set override=true to proceed", trustIndex.Score, threshold))
+		writeAPIError(w, http.StatusUnprocessableEntity, contracts.ErrCodePolicyViolation,
+			fmt.Sprintf("trust score %d is below threshold %d; set override=true to proceed", trustIndex.Score, threshold), "")
+		return
+	}
+
+	if req.Override && !allowOverride {
+		writeAPIError(w, http.StatusForbidden, contracts.ErrCodePolicyViolation,
+			"policy does not allow trust score override", "allow_override=false")
 		return
 	}
 

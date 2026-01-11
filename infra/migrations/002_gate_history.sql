@@ -26,7 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_run_gate_results_lookup ON run_gate_results(run_i
 
 -- Backfill: migrate existing gates from runs.gates_json into run_gate_results
 -- Note: This is best-effort. Each existing gate gets an ID derived from run_id + hash.
--- Skip if gates_json is empty or null.
+-- Skip if gates_json is empty, null, or not an array.
 DO $$
 DECLARE
     r RECORD;
@@ -34,7 +34,7 @@ DECLARE
     gate_id TEXT;
     gate_name TEXT;
 BEGIN
-    FOR r IN SELECT id, gates_json FROM runs WHERE gates_json IS NOT NULL AND gates_json != '[]'::jsonb LOOP
+    FOR r IN SELECT id, gates_json FROM runs WHERE gates_json IS NOT NULL AND gates_json != '[]'::jsonb AND jsonb_typeof(gates_json) = 'array' LOOP
         FOR gate_record IN SELECT * FROM jsonb_array_elements(r.gates_json) LOOP
             -- Generate deterministic ID from run_id and gate content
             gate_id := r.id || '-' || md5(gate_record::text);

@@ -19,7 +19,19 @@ async function fetchJSON<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+export interface CreateWorkflowRequest {
+  mode: string;
+  prompt: string;
+}
+
 export const api = {
+  createWorkflow(req: CreateWorkflowRequest): Promise<WorkflowRun> {
+    return fetchJSON<WorkflowRun>('/workflows', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    });
+  },
+
   listRuns(): Promise<ListRunsResponse> {
     return fetchJSON<ListRunsResponse>('/runs');
   },

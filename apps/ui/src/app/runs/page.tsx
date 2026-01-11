@@ -2,17 +2,22 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
 import type { WorkflowRun, GateResult } from '@/lib/types';
 
 type StatusFilter = 'all' | 'running' | 'completed' | 'failed';
 
 export default function RunsPage() {
+  const router = useRouter();
   const [runs, setRuns] = useState<WorkflowRun[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchId, setSearchId] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [showNewRun, setShowNewRun] = useState(false);
+  const [prompt, setPrompt] = useState('');
+  const [creating, setCreating] = useState(false);
 
   useEffect(() => {
     loadRuns();
@@ -29,6 +34,24 @@ export default function RunsPage() {
       setError(err instanceof Error ? err.message : 'Failed to load runs');
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleCreateRun(e: React.FormEvent) {
+    e.preventDefault();
+    if (!prompt.trim()) return;
+
+    setCreating(true);
+    setError(null);
+    try {
+      const run = await api.createWorkflow({ mode: 'generate', prompt: prompt.trim() });
+      setShowNewRun(false);
+      setPrompt('');
+      router.push(`/runs/${run.id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to create run');
+    } finally {
+      setCreating(false);
     }
   }
 
@@ -87,10 +110,59 @@ export default function RunsPage() {
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-8">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">Workflow Runs</h1>
-        <p className="text-gray-600 mt-1">Monitor and manage workflow executions</p>
+      <div className="mb-6 flex items-start justify-between">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Workflow Runs</h1>
+          <p className="text-gray-600 mt-1">Monitor and manage workflow executions</p>
+        </div>
+        <button
+          onClick={() => setShowNewRun(true)}
+          className="btn btn-primary"
+        >
+          + New Run
+        </button>
       </div>
+
+      {/* New Run Modal */}
+      {showNewRun && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl p-6 w-full max-w-lg mx-4">
+            <h2 className="text-xl font-semibold text-gray-900 mb-4">Create New Run</h2>
+            <form onSubmit={handleCreateRun}>
+              <div className="mb-4">
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Prompt
+                </label>
+                <textarea
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  placeholder="Describe what you want to build... e.g., Create a Go HTTP service with /health endpoint"
+                  rows={4}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  autoFocus
+                />
+              </div>
+              <div className="flex justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => { setShowNewRun(false); setPrompt(''); }}
+                  className="btn btn-secondary"
+                  disabled={creating}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={creating || !prompt.trim()}
+                >
+                  {creating ? 'Creating...' : 'Create Run'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-md text-red-700">

@@ -498,7 +498,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, event := range existingEvents {
 		data, _ := json.Marshal(event)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
+		// Use unnamed events so browser's onmessage handler fires
+		fmt.Fprintf(w, "data: %s\n\n", data)
 	}
 	flusher.Flush()
 
@@ -514,7 +515,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			data, _ := json.Marshal(event)
-			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
+			// Use unnamed events so browser's onmessage handler fires
+			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
 		case <-r.Context().Done():
 			return

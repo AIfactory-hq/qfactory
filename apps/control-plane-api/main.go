@@ -18,12 +18,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"go.temporal.io/sdk/client"
 
 	"github.com/AIfactory-hq/qfactory/apps/orchestrator-worker/workflow"
+	"github.com/AIfactory-hq/qfactory/internal/modelruntime"
 	"github.com/AIfactory-hq/qfactory/pkg/contracts"
 	"github.com/AIfactory-hq/qfactory/pkg/events"
 )
@@ -203,11 +205,49 @@ func main() {
 
 	evidenceSvc := NewEvidenceService(contracts.EvidenceDir)
 
+	// Initialize search service
+	qdrantURL := os.Getenv("QDRANT_URL")
+	if qdrantURL == "" {
+		qdrantURL = "http://localhost:6333"
+	}
+
+	searchSvc, err := NewSearchService(qdrantURL)
+	if err != nil {
+		log.Printf("Warning: Search service not available: %v", err)
+		// Continue without search - it's optional for v0.3b
+	}
+
+	// Initialize model runtime
+	modelProvider := os.Getenv("MODEL_PROVIDER")
+	if modelProvider == "" {
+		modelProvider = "ollama"
+	}
+
+	var modelRT modelruntime.Runtime
+	switch modelProvider {
+	case "mock":
+		modelRT = modelruntime.NewMockRuntime()
+		log.Printf("Using mock model runtime")
+	case "ollama":
+		cfg := modelruntime.LoadOllamaConfigFromEnv()
+		modelRT = modelruntime.NewOllamaRuntime(cfg)
+		log.Printf("Using Ollama model runtime at %s", cfg.URL)
+	default:
+		log.Printf("Unknown MODEL_PROVIDER=%s, defaulting to ollama", modelProvider)
+		cfg := modelruntime.LoadOllamaConfigFromEnv()
+		modelRT = modelruntime.NewOllamaRuntime(cfg)
+	}
+
+	budgetMgr := modelruntime.NewBudgetManager()
+
 	store := NewStore()
 	server := &Server{
-		store:       store,
-		temporal:    tc,
-		evidenceSvc: evidenceSvc,
+		store:        store,
+		temporal:     tc,
+		evidenceSvc:  evidenceSvc,
+		searchSvc:    searchSvc,
+		modelRuntime: modelRT,
+		budgetMgr:    budgetMgr,
 	}
 
 	mux := http.NewServeMux()
@@ -220,6 +260,15 @@ func main() {
 	mux.HandleFunc("GET /runs/{id}/evidence.zip", server.handleGetEvidenceZip)
 	mux.HandleFunc("POST /internal/events", server.handleInternalEvent)
 
+	// Search endpoints (v0.3b)
+	mux.HandleFunc("POST /search/index", server.handleSearchIndex)
+	mux.HandleFunc("GET /search", server.handleSearch)
+
+	// Model runtime endpoints (v0.3c)
+	mux.HandleFunc("GET /models/health", server.handleModelsHealth)
+	mux.HandleFunc("POST /runs/{id}/model/complete", server.handleModelComplete)
+	mux.HandleFunc("PATCH /runs/{id}/budget", server.handlePatchBudget)
+
 	addr := ":8090"
 	log.Printf("Control-plane API listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
@@ -229,9 +278,12 @@ func main() {
 
 // Server holds dependencies for HTTP handlers.
 type Server struct {
-	store       *Store
-	temporal    client.Client
-	evidenceSvc *EvidenceService
+	store        *Store
+	temporal     client.Client
+	evidenceSvc  *EvidenceService
+	searchSvc    *SearchService
+	modelRuntime modelruntime.Runtime
+	budgetMgr    *modelruntime.BudgetManager
 }
 
 // writeJSON writes a JSON response with the given status code.
@@ -580,6 +632,38 @@ func generateRunID() string {
 	return hex.EncodeToString(b)
 }
 
+// UpdateRun updates a run in the store (used for budget policy updates).
+func (s *Store) UpdateRun(run *contracts.WorkflowRun) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.runs[run.ID]; !ok {
+		return false
+	}
+	s.runs[run.ID] = run
+	return true
+}
+
+// AddModelCall adds a model call summary to a run.
+func (s *Store) AddModelCall(runID string, call contracts.ModelCallSummary) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[runID]
+	if !ok {
+		return false
+	}
+	run.ModelCalls = append(run.ModelCalls, call)
+	run.UpdatedAt = time.Now().UTC()
+	return true
+}
+
+// truncateString truncates a string to maxLen bytes.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
+}
+
 // EvidenceService handles writing evidence bundles to disk.
 type EvidenceService struct {
 	baseDir string
@@ -710,6 +794,43 @@ func (e *EvidenceService) WriteMetadata(runID string, run *contracts.WorkflowRun
 	return os.WriteFile(filepath.Join(runDir, "metadata.json"), data, 0644)
 }
 
+// WriteModelCallEvidence appends a model call to model_calls.jsonl.
+func (e *EvidenceService) WriteModelCallEvidence(runID string, req contracts.CompletionRequest, resp *contracts.CompletionResponse, errMsg string) error {
+	runDir := filepath.Join(e.baseDir, runID)
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		return fmt.Errorf("failed to create run dir: %w", err)
+	}
+
+	// Redact: truncate prompt and system to 4KB each
+	record := map[string]interface{}{
+		"timestamp": time.Now().UTC(),
+		"request": map[string]interface{}{
+			"model":             req.Model,
+			"prompt":            truncateString(req.Prompt, 4096),
+			"system":            truncateString(req.System, 4096),
+			"max_output_tokens": req.MaxOutputTokens,
+			"temperature":       req.Temperature,
+		},
+		"response": resp,
+		"error":    errMsg,
+	}
+
+	line, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("failed to marshal model call: %w", err)
+	}
+
+	f, err := os.OpenFile(filepath.Join(runDir, "model_calls.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open model_calls.jsonl: %w", err)
+	}
+	defer f.Close()
+
+	f.Write(line)
+	f.WriteString("\n")
+	return nil
+}
+
 // ZipEvidence creates a zip archive of the evidence bundle.
 func (e *EvidenceService) ZipEvidence(runID string, run *contracts.WorkflowRun, evts []events.Event) error {
 	runDir := filepath.Join(e.baseDir, runID)
@@ -763,4 +884,288 @@ func (e *EvidenceService) ZipEvidence(runID string, run *contracts.WorkflowRun, 
 		_, err = io.Copy(writer, file)
 		return err
 	})
+}
+
+// handleSearchIndex handles POST /search/index
+func (s *Server) handleSearchIndex(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if s.searchSvc == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "search service not available")
+		return
+	}
+
+	var req IndexRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.Path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path is required")
+		return
+	}
+
+	resp, err := s.searchSvc.Index(req)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleSearch handles GET /search
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if s.searchSvc == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "search service not available")
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		writeJSONError(w, http.StatusBadRequest, "query parameter 'q' is required")
+		return
+	}
+
+	k := DefaultSearchK
+	if kStr := r.URL.Query().Get("k"); kStr != "" {
+		if kVal, err := strconv.Atoi(kStr); err == nil && kVal > 0 {
+			k = kVal
+		}
+	}
+
+	resp, err := s.searchSvc.Search(query, k)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// setCORSHeaders sets CORS headers for cross-origin requests.
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+}
+
+// handleModelsHealth handles GET /models/health
+func (s *Server) handleModelsHealth(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	status, err := s.modelRuntime.Health(ctx)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, status)
+}
+
+// ModelCompleteRequest is the request body for model completion.
+type ModelCompleteRequest struct {
+	Model           string  `json:"model,omitempty"`
+	Prompt          string  `json:"prompt"`
+	System          string  `json:"system,omitempty"`
+	MaxOutputTokens int     `json:"max_output_tokens,omitempty"`
+	Temperature     float64 `json:"temperature,omitempty"`
+}
+
+// ModelCompleteResponse is the response for model completion.
+type ModelCompleteResponse struct {
+	OK       bool                        `json:"ok"`
+	Response *contracts.CompletionResponse `json:"response,omitempty"`
+	Budget   contracts.BudgetDecision    `json:"budget"`
+	Error    string                      `json:"error,omitempty"`
+}
+
+// handleModelComplete handles POST /runs/{id}/model/complete
+func (s *Server) handleModelComplete(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	run, ok := s.store.GetRun(id)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	var req ModelCompleteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if strings.TrimSpace(req.Prompt) == "" {
+		writeJSONError(w, http.StatusBadRequest, "prompt is required")
+		return
+	}
+
+	// Initialize budget state with run's policy
+	s.budgetMgr.GetOrCreateState(id, run.BudgetPolicy)
+
+	// Estimate request tokens (prompt + system chars / 4)
+	estimatedTokens := (len(req.Prompt) + len(req.System)) / 4
+
+	// Check budget before calling model
+	decision := s.budgetMgr.CheckBudget(id, estimatedTokens)
+	if !decision.Allowed {
+		writeJSON(w, http.StatusTooManyRequests, ModelCompleteResponse{
+			OK:     false,
+			Budget: decision,
+			Error:  decision.Reason,
+		})
+		return
+	}
+
+	// Build completion request
+	completionReq := contracts.CompletionRequest{
+		Model:           req.Model,
+		Prompt:          req.Prompt,
+		System:          req.System,
+		MaxOutputTokens: req.MaxOutputTokens,
+		Temperature:     req.Temperature,
+	}
+
+	// Set up context with timeout based on budget policy
+	maxLatencyMs := s.budgetMgr.GetMaxLatencyMs(id)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(maxLatencyMs)*time.Millisecond)
+	defer cancel()
+
+	// Call model runtime
+	resp, err := s.modelRuntime.Complete(ctx, completionReq)
+
+	// Record model call summary
+	callSummary := contracts.ModelCallSummary{
+		Timestamp: time.Now().UTC(),
+		Stage:     run.CurrentStage,
+		OK:        err == nil,
+	}
+
+	if resp != nil {
+		callSummary.Provider = resp.Provider
+		callSummary.Model = resp.Model
+		callSummary.InputTokens = resp.Usage.InputTokens
+		callSummary.OutputTokens = resp.Usage.OutputTokens
+		callSummary.TotalTokens = resp.Usage.TotalTokens
+		callSummary.LatencyMs = resp.LatencyMs
+
+		// Record usage in budget manager
+		s.budgetMgr.RecordUsage(id, resp.Usage.TotalTokens, resp.LatencyMs)
+	}
+
+	if err != nil {
+		callSummary.Error = err.Error()
+	}
+
+	// Add model call to run
+	s.store.AddModelCall(id, callSummary)
+
+	// Write evidence
+	errMsg := ""
+	if err != nil {
+		errMsg = err.Error()
+	}
+	if writeErr := s.evidenceSvc.WriteModelCallEvidence(id, completionReq, resp, errMsg); writeErr != nil {
+		log.Printf("Failed to write model call evidence: %v", writeErr)
+	}
+
+	// Get updated budget decision
+	updatedDecision := s.budgetMgr.CheckBudget(id, 0)
+
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, ModelCompleteResponse{
+			OK:     false,
+			Budget: updatedDecision,
+			Error:  err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ModelCompleteResponse{
+		OK:       true,
+		Response: resp,
+		Budget:   updatedDecision,
+	})
+}
+
+// handlePatchBudget handles PATCH /runs/{id}/budget
+func (s *Server) handlePatchBudget(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	run, ok := s.store.GetRun(id)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	var policy contracts.BudgetPolicy
+	if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	// Validate policy values
+	if policy.MaxTotalTokensPerRun <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "max_total_tokens_per_run must be > 0")
+		return
+	}
+	if policy.MaxTotalRequestsPerRun <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "max_total_requests_per_run must be > 0")
+		return
+	}
+	if policy.MaxRequestTokens <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "max_request_tokens must be > 0")
+		return
+	}
+	if policy.MaxLatencyMs <= 0 {
+		writeJSONError(w, http.StatusBadRequest, "max_latency_ms must be > 0")
+		return
+	}
+
+	// Update run and budget manager
+	run.BudgetPolicy = &policy
+	run.UpdatedAt = time.Now().UTC()
+	s.store.UpdateRun(run)
+	s.budgetMgr.SetPolicy(id, &policy)
+
+	writeJSON(w, http.StatusOK, run)
 }

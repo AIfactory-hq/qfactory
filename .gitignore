@@ -6,6 +6,9 @@
 *.dylib
 bin/
 dist/
+control-plane-api
+gate-runner
+orchestrator-worker
 
 # Test binary
 *.test

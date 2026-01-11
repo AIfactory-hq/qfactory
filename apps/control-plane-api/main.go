@@ -23,6 +23,7 @@ import (
 	"go.temporal.io/sdk/client"
 
 	"github.com/AIfactory-hq/qfactory/apps/orchestrator-worker/workflow"
+	"github.com/AIfactory-hq/qfactory/internal/gates"
 	"github.com/AIfactory-hq/qfactory/internal/modelruntime"
 	"github.com/AIfactory-hq/qfactory/internal/store"
 	"github.com/AIfactory-hq/qfactory/pkg/contracts"
@@ -99,6 +100,8 @@ func main() {
 	budgetMgr := modelruntime.NewBudgetManager()
 	budgetMgr.SetStore(pgStore)
 
+	gateRunner := gates.NewGateRunner(pgStore, contracts.EvidenceDir)
+
 	server := &Server{
 		store:        pgStore,
 		sseHub:       sseHub,
@@ -107,6 +110,7 @@ func main() {
 		searchSvc:    searchSvc,
 		modelRuntime: modelRT,
 		budgetMgr:    budgetMgr,
+		gateRunner:   gateRunner,
 	}
 
 	mux := http.NewServeMux()
@@ -115,6 +119,7 @@ func main() {
 	mux.HandleFunc("GET /runs/{id}", server.handleGetRun)
 	mux.HandleFunc("GET /runs/{id}/events", server.handleSSE)
 	mux.HandleFunc("POST /runs/{id}/gates/pr1", server.handlePR1Gate)
+	mux.HandleFunc("POST /runs/{id}/gates/pr2", server.handlePR2Gate)
 	mux.HandleFunc("GET /runs/{id}/evidence", server.handleGetEvidence)
 	mux.HandleFunc("GET /runs/{id}/evidence.zip", server.handleGetEvidenceZip)
 	mux.HandleFunc("POST /internal/events", server.handleInternalEvent)
@@ -144,6 +149,7 @@ type Server struct {
 	searchSvc    *SearchService
 	modelRuntime modelruntime.Runtime
 	budgetMgr    *modelruntime.BudgetManager
+	gateRunner   *gates.GateRunner
 }
 
 // writeJSON writes a JSON response with the given status code.
@@ -472,6 +478,67 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 		if err := s.evidenceSvc.WriteManifest(id, run, evts); err != nil {
 			log.Printf("Failed to write manifest: %v", err)
 		}
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handlePR2Gate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if run is not completed (PR0/PR1 must have finished)
+	if run.Status != contracts.RunStatusCompleted {
+		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to run PR2 gate (current status: %s)", run.Status))
+		return
+	}
+
+	// Execute PR2 gate
+	gate := gates.NewIntegrationSmokeGate()
+	result, err := s.gateRunner.RunGate(ctx, id, gate)
+	if err != nil {
+		// Gate runner already persisted failure evidence; return 500
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("gate execution failed: %v", err))
+		return
+	}
+
+	// Update evidence files
+	evts, err := s.store.ListEvents(ctx, id, 1000)
+	if err != nil {
+		log.Printf("Warning: failed to list events: %v", err)
+	}
+	if err := s.evidenceSvc.WriteEventsJSONL(id, evts); err != nil {
+		log.Printf("Failed to write events.jsonl: %v", err)
+	}
+
+	// Refresh run and write manifest
+	run, _, err = s.store.GetRun(ctx, id)
+	if err != nil {
+		log.Printf("Warning: failed to refresh run: %v", err)
+	}
+	if run != nil {
+		if err := s.evidenceSvc.WriteManifest(id, run, evts); err != nil {
+			log.Printf("Failed to write manifest: %v", err)
+		}
+	}
+
+	if !result.Passed {
+		writeJSON(w, http.StatusUnprocessableEntity, result)
+		return
 	}
 
 	writeJSON(w, http.StatusOK, result)

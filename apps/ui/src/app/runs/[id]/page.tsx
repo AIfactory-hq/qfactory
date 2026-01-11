@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { api } from '@/lib/api';
-import type { WorkflowRun, SSEEvent } from '@/lib/types';
+import type { WorkflowRun, SSEEvent, SearchResult } from '@/lib/types';
 
 export default function RunDetailPage() {
   const params = useParams();
@@ -15,9 +15,17 @@ export default function RunDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [runningGate, setRunningGate] = useState(false);
+  const [runningPR2, setRunningPR2] = useState(false);
   const [paused, setPaused] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventsEndRef = useRef<HTMLDivElement>(null);
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [expandedResult, setExpandedResult] = useState<number | null>(null);
 
   const loadRun = useCallback(async () => {
     try {
@@ -78,6 +86,36 @@ export default function RunDetailPage() {
     }
   }
 
+  async function handleRunPR2() {
+    setRunningPR2(true);
+    try {
+      await api.runPR2Gate(runId);
+      await loadRun();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to run PR2 gate');
+    } finally {
+      setRunningPR2(false);
+    }
+  }
+
+  async function handleSearch(e: React.FormEvent) {
+    e.preventDefault();
+    if (!searchQuery.trim()) return;
+
+    setSearching(true);
+    setSearchError(null);
+    setExpandedResult(null);
+    try {
+      const response = await api.search(searchQuery.trim(), 8);
+      setSearchResults(response.results);
+    } catch (err) {
+      setSearchError(err instanceof Error ? err.message : 'Search failed');
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
+    }
+  }
+
   function formatDate(dateStr: string | undefined) {
     if (!dateStr) return '-';
     return new Date(dateStr).toLocaleString();
@@ -107,6 +145,7 @@ export default function RunDetailPage() {
   }
 
   const pr1Gate = run?.gates?.find((g) => g.level === 'PR1');
+  const pr2Gate = run?.gates?.find((g) => g.level === 'PR2' && g.name === 'integration_smoke');
 
   if (loading) {
     return (
@@ -252,6 +291,128 @@ export default function RunDetailPage() {
                 Download Evidence Bundle
               </a>
             </div>
+          </div>
+
+          {/* PR2 Gate */}
+          <div className="card">
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">PR2 Gate (Integration Tests)</h2>
+            {pr2Gate ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`badge ${pr2Gate.passed ? 'badge-passed' : 'badge-failed'}`}
+                  >
+                    {pr2Gate.passed ? 'Passed' : 'Failed'}
+                  </span>
+                  {pr2Gate.duration_ms && (
+                    <span className="text-sm text-gray-500">
+                      {(pr2Gate.duration_ms / 1000).toFixed(2)}s
+                    </span>
+                  )}
+                  {pr2Gate.executor && (
+                    <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded">
+                      {pr2Gate.executor}
+                    </span>
+                  )}
+                </div>
+                <div className="text-sm text-gray-600">
+                  <div>Timestamp: {formatDate(pr2Gate.timestamp)}</div>
+                  {pr2Gate.evidence_path && (
+                    <div className="mt-1">Evidence: {pr2Gate.evidence_path}</div>
+                  )}
+                </div>
+                {pr2Gate.checks?.map((check, i) => (
+                  <div key={i} className="text-sm pl-2 border-l-2 border-gray-200">
+                    <span className={check.passed ? 'text-green-600' : 'text-red-600'}>
+                      {check.passed ? '✓' : '✗'}
+                    </span>{' '}
+                    {check.name}: {check.message}
+                  </div>
+                ))}
+                {pr2Gate.error && (
+                  <div className="text-sm text-red-600 bg-red-50 p-2 rounded">
+                    {pr2Gate.error}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-gray-500 text-sm">PR2 gate has not been executed yet.</p>
+            )}
+            <div className="mt-4">
+              <button
+                onClick={handleRunPR2}
+                disabled={runningPR2 || run?.status !== 'completed'}
+                className="btn btn-primary"
+                title={run?.status !== 'completed' ? 'Run must be completed to run PR2 gate' : ''}
+              >
+                {runningPR2 ? 'Running...' : 'Run PR2 Gate'}
+              </button>
+            </div>
+          </div>
+
+          {/* Search Panel */}
+          <div className="card">
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">Code Search</h2>
+            <form onSubmit={handleSearch} className="flex gap-2 mb-4">
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search code..."
+                className="flex-1 px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+              />
+              <button
+                type="submit"
+                disabled={searching || !searchQuery.trim()}
+                className="btn btn-primary"
+              >
+                {searching ? 'Searching...' : 'Search'}
+              </button>
+            </form>
+
+            {searchError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-700 text-sm mb-4">
+                {searchError}
+              </div>
+            )}
+
+            {searchResults.length > 0 && (
+              <div className="space-y-2 max-h-80 overflow-y-auto">
+                {searchResults.map((result, index) => (
+                  <div
+                    key={`${result.path}-${result.chunk_index}`}
+                    className="border border-gray-200 rounded-md overflow-hidden"
+                  >
+                    <button
+                      onClick={() => setExpandedResult(expandedResult === index ? null : index)}
+                      className="w-full px-3 py-2 bg-gray-50 hover:bg-gray-100 text-left flex items-center justify-between"
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="font-mono text-sm text-gray-900 truncate">{result.path}</span>
+                        <span className="text-xs text-gray-500 shrink-0">#{result.chunk_index}</span>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className="text-xs text-gray-500">{(result.score * 100).toFixed(1)}%</span>
+                        <span className="text-gray-400">{expandedResult === index ? '▲' : '▼'}</span>
+                      </div>
+                    </button>
+                    {expandedResult === index && (
+                      <div className="p-3 bg-white border-t border-gray-200">
+                        <pre className="text-xs font-mono text-gray-700 whitespace-pre-wrap overflow-x-auto">
+                          {result.content}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {searchResults.length === 0 && !searching && searchQuery && !searchError && (
+              <div className="text-gray-500 text-sm text-center py-4">
+                No results found. Try indexing the repository first.
+              </div>
+            )}
           </div>
         </div>
 

@@ -429,7 +429,8 @@ func (s *PostgresStore) ListEvents(ctx context.Context, runID string, limit int)
 	return evts, rows.Err()
 }
 
-// AddGateResult appends a gate result to a run.
+// AddGateResult adds or replaces a gate result for a run.
+// Uses replace semantics: if a gate with the same level+name exists, it is replaced.
 func (s *PostgresStore) AddGateResult(ctx context.Context, runID string, result contracts.GateResult) error {
 	run, found, err := s.GetRun(ctx, runID)
 	if err != nil {
@@ -439,7 +440,28 @@ func (s *PostgresStore) AddGateResult(ctx context.Context, runID string, result 
 		return fmt.Errorf("run not found: %s", runID)
 	}
 
-	run.Gates = append(run.Gates, result)
+	// Normalize empty gate name to avoid duplicate issues
+	if result.Name == "" {
+		result.Name = "default"
+	}
+
+	// Replace existing gate with same level+name, or append if new
+	replaced := false
+	for i, g := range run.Gates {
+		gName := g.Name
+		if gName == "" {
+			gName = "default"
+		}
+		if g.Level == result.Level && gName == result.Name {
+			run.Gates[i] = result
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		run.Gates = append(run.Gates, result)
+	}
+
 	run.UpdatedAt = time.Now().UTC()
 	return s.UpdateRun(ctx, run)
 }

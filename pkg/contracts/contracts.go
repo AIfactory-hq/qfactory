@@ -99,13 +99,17 @@ type StageStatus struct {
 
 // GateResult represents the result of a quality gate check.
 type GateResult struct {
-	Level        string    `json:"level"` // PR0, PR1, PR2, PR3
-	Passed       bool      `json:"passed"`
-	Checks       []Check   `json:"checks"`
-	Timestamp    time.Time `json:"timestamp"`
-	DurationMs   int64     `json:"duration_ms"`
-	EvidencePath string    `json:"evidence_path,omitempty"`
-	Error        string    `json:"error,omitempty"`
+	Level        string     `json:"level"` // PR0, PR1, PR2, PR3
+	Name         string     `json:"name,omitempty"`
+	Passed       bool       `json:"passed"`
+	Checks       []Check    `json:"checks"`
+	Timestamp    time.Time  `json:"timestamp"`
+	DurationMs   int64      `json:"duration_ms"`
+	Executor     string     `json:"executor,omitempty"`
+	StartedAt    *time.Time `json:"started_at,omitempty"`
+	CompletedAt  *time.Time `json:"completed_at,omitempty"`
+	EvidencePath string     `json:"evidence_path,omitempty"`
+	Error        string     `json:"error,omitempty"`
 }
 
 // Check represents a single check within a gate.

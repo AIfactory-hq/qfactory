@@ -14,10 +14,14 @@ export interface Check {
 
 export interface GateResult {
   level: string;
+  name?: string;
   passed: boolean;
   checks?: Check[];
   timestamp?: string;
   duration_ms?: number;
+  executor?: string;
+  started_at?: string;
+  completed_at?: string;
   evidence_path?: string;
   error?: string;
 }
@@ -50,4 +54,34 @@ export interface SSEEvent {
     stage_index?: number;
     error?: string;
   };
+}
+
+// Search types (v0.3b)
+export interface SearchResult {
+  path: string;
+  score: number;
+  chunk_index: number;
+  sha256: string;
+  snippet: string;
+  content: string;
+}
+
+export interface SearchResponse {
+  query: string;
+  k: number;
+  results: SearchResult[];
+}
+
+export interface IndexRequest {
+  path: string;
+  globs?: string[];
+  exclude?: string[];
+}
+
+export interface IndexResponse {
+  files_indexed: number;
+  chunks_created: number;
+  files: string[];
+  duration_ms: number;
+  error?: string;
 }

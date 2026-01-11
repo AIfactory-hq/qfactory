@@ -36,7 +36,7 @@ qfactory/
 
 ## Local Development Quickstart
 
-Prerequisites: Docker, Docker Compose, Go 1.22+
+Prerequisites: Docker, Docker Compose, Go 1.22+, Node.js 18+
 
 ```bash
 # 1. Start infrastructure (Postgres, Redis, Qdrant, Temporal)
@@ -51,15 +51,18 @@ Prerequisites: Docker, Docker Compose, Go 1.22+
 # 4. In terminal 2: Start the orchestrator worker
 ./scripts/run-worker.sh
 
-# 5. Create a workflow run
+# 5. In terminal 3: Start the UI dashboard
+./scripts/run-ui.sh
+
+# 6. Create a workflow run
 curl -X POST http://localhost:8090/workflows \
   -H "Content-Type: application/json" \
   -d '{"type":"demo","requirement":"test run"}'
 
-# 6. Watch events via SSE (replace RUN_ID with id from step 5)
+# 7. Watch events via SSE (replace RUN_ID with id from step 6)
 curl -N http://localhost:8090/runs/RUN_ID/events
 
-# 7. Check run status
+# 8. Check run status
 curl http://localhost:8090/runs/RUN_ID
 
 # Stop infrastructure when done
@@ -71,6 +74,7 @@ curl http://localhost:8090/runs/RUN_ID
 | Service | URL |
 |---------|-----|
 | Control Plane API | http://localhost:8090 |
+| qfactory Dashboard | http://localhost:3000 |
 | Temporal UI | http://localhost:8088 |
 | Qdrant Dashboard | http://localhost:6333/dashboard |
 
@@ -89,6 +93,16 @@ curl http://localhost:8090/runs/RUN_ID
 ### PR1 Gate (v0.2)
 
 The PR1 gate runs `go test ./...` with a configurable timeout (default 60s, set via `QF_PR1_TIMEOUT_SECONDS`). Evidence is written to `evidence/<run_id>/` including stdout, stderr, and timing.
+
+### Dashboard UI (v0.2)
+
+The Next.js dashboard provides a visual interface for monitoring workflow runs:
+
+- **Runs List** (`/runs`): View all runs with status, timestamps, and PR1 gate results
+- **Run Detail** (`/runs/[id]`): Pipeline stages, gate execution, live SSE events
+
+Environment variables:
+- `NEXT_PUBLIC_API_BASE_URL`: API endpoint (default: `http://localhost:8090`)
 
 ## PR Levels (Quality Gates)
 

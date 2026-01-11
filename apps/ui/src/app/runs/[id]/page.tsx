@@ -1,0 +1,309 @@
+'use client';
+
+import { useEffect, useState, useRef, useCallback } from 'react';
+import Link from 'next/link';
+import { useParams } from 'next/navigation';
+import { api } from '@/lib/api';
+import type { WorkflowRun, SSEEvent } from '@/lib/types';
+
+export default function RunDetailPage() {
+  const params = useParams();
+  const runId = params.id as string;
+
+  const [run, setRun] = useState<WorkflowRun | null>(null);
+  const [events, setEvents] = useState<SSEEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [runningGate, setRunningGate] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  const eventsEndRef = useRef<HTMLDivElement>(null);
+
+  const loadRun = useCallback(async () => {
+    try {
+      const data = await api.getRun(runId);
+      setRun(data);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load run');
+    } finally {
+      setLoading(false);
+    }
+  }, [runId]);
+
+  useEffect(() => {
+    loadRun();
+  }, [loadRun]);
+
+  useEffect(() => {
+    if (paused) return;
+
+    const es = api.subscribeToEvents(runId);
+    eventSourceRef.current = es;
+
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        setEvents((prev) => [...prev, data]);
+        loadRun();
+      } catch {
+        // Ignore parse errors
+      }
+    };
+
+    es.onerror = () => {
+      // SSE reconnects automatically
+    };
+
+    return () => {
+      es.close();
+    };
+  }, [runId, paused, loadRun]);
+
+  useEffect(() => {
+    if (!paused) {
+      eventsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [events, paused]);
+
+  async function handleRunPR1() {
+    setRunningGate(true);
+    try {
+      await api.runPR1Gate(runId);
+      await loadRun();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to run PR1 gate');
+    } finally {
+      setRunningGate(false);
+    }
+  }
+
+  function formatDate(dateStr: string | undefined) {
+    if (!dateStr) return '-';
+    return new Date(dateStr).toLocaleString();
+  }
+
+  function formatTime(dateStr: string | undefined) {
+    if (!dateStr) return '-';
+    return new Date(dateStr).toLocaleTimeString();
+  }
+
+  function getStageState(stageName: string) {
+    const stage = run?.stages?.find((s) => s.name === stageName);
+    return stage?.state || 'pending';
+  }
+
+  function getStageClass(state: string) {
+    switch (state) {
+      case 'completed':
+        return 'bg-green-100 border-green-500 text-green-800';
+      case 'running':
+        return 'bg-blue-100 border-blue-500 text-blue-800 animate-pulse';
+      case 'failed':
+        return 'bg-red-100 border-red-500 text-red-800';
+      default:
+        return 'bg-gray-100 border-gray-300 text-gray-600';
+    }
+  }
+
+  const pr1Gate = run?.gates?.find((g) => g.level === 'PR1');
+
+  if (loading) {
+    return (
+      <div className="max-w-7xl mx-auto px-4 py-8">
+        <div className="text-center py-12 text-gray-500">Loading run details...</div>
+      </div>
+    );
+  }
+
+  if (error && !run) {
+    return (
+      <div className="max-w-7xl mx-auto px-4 py-8">
+        <div className="p-4 bg-red-50 border border-red-200 rounded-md text-red-700">
+          {error}
+        </div>
+        <Link href="/runs" className="mt-4 inline-block text-indigo-600 hover:text-indigo-900">
+          &larr; Back to runs
+        </Link>
+      </div>
+    );
+  }
+
+  const stages = ['spec', 'contract', 'plan', 'implement', 'verify'];
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 py-8">
+      <div className="mb-6">
+        <Link href="/runs" className="text-indigo-600 hover:text-indigo-900 text-sm">
+          &larr; Back to runs
+        </Link>
+        <h1 className="text-2xl font-bold text-gray-900 mt-2 font-mono">{runId}</h1>
+        <div className="flex items-center gap-4 mt-2">
+          <span
+            className={`badge ${
+              run?.status === 'completed'
+                ? 'badge-completed'
+                : run?.status === 'failed'
+                ? 'badge-failed'
+                : run?.status === 'running'
+                ? 'badge-running'
+                : 'badge-pending'
+            }`}
+          >
+            {run?.status}
+          </span>
+          {run?.temporal_id && (
+            <span className="text-sm text-gray-500">Temporal: {run.temporal_id}</span>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-md text-red-700">
+          {error}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Left Column: Stages and Gates */}
+        <div className="space-y-6">
+          {/* Stage Timeline */}
+          <div className="card">
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">Pipeline Stages</h2>
+            <div className="space-y-3">
+              {stages.map((stage, index) => {
+                const state = getStageState(stage);
+                const stageData = run?.stages?.find((s) => s.name === stage);
+                return (
+                  <div
+                    key={stage}
+                    className={`p-3 rounded-lg border-l-4 ${getStageClass(state)}`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium capitalize">{stage}</span>
+                        <span className="text-xs opacity-75">({state})</span>
+                      </div>
+                      <div className="text-xs">
+                        {stageData?.started_at && (
+                          <span>Started: {formatTime(stageData.started_at)}</span>
+                        )}
+                        {stageData?.completed_at && (
+                          <span className="ml-2">
+                            Completed: {formatTime(stageData.completed_at)}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* PR1 Gate */}
+          <div className="card">
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">PR1 Gate (Unit Tests)</h2>
+            {pr1Gate ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`badge ${pr1Gate.passed ? 'badge-passed' : 'badge-failed'}`}
+                  >
+                    {pr1Gate.passed ? 'Passed' : 'Failed'}
+                  </span>
+                  {pr1Gate.duration_ms && (
+                    <span className="text-sm text-gray-500">
+                      {(pr1Gate.duration_ms / 1000).toFixed(2)}s
+                    </span>
+                  )}
+                </div>
+                <div className="text-sm text-gray-600">
+                  <div>Timestamp: {formatDate(pr1Gate.timestamp)}</div>
+                  {pr1Gate.evidence_path && (
+                    <div className="mt-1">Evidence: {pr1Gate.evidence_path}</div>
+                  )}
+                </div>
+                {pr1Gate.checks?.map((check, i) => (
+                  <div key={i} className="text-sm pl-2 border-l-2 border-gray-200">
+                    <span className={check.passed ? 'text-green-600' : 'text-red-600'}>
+                      {check.passed ? '✓' : '✗'}
+                    </span>{' '}
+                    {check.name}: {check.message}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-gray-500 text-sm">PR1 gate has not been executed yet.</p>
+            )}
+            <div className="mt-4 flex gap-3">
+              <button
+                onClick={handleRunPR1}
+                disabled={runningGate}
+                className="btn btn-primary"
+              >
+                {runningGate ? 'Running...' : 'Run PR1 Gate'}
+              </button>
+              <a
+                href={api.getEvidenceZipUrl(runId)}
+                className="btn btn-secondary"
+                download
+              >
+                Download Evidence Bundle
+              </a>
+            </div>
+          </div>
+        </div>
+
+        {/* Right Column: Events */}
+        <div className="card flex flex-col" style={{ maxHeight: '600px' }}>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-semibold text-gray-900">Live Events</h2>
+            <button
+              onClick={() => setPaused(!paused)}
+              className={`btn text-sm ${paused ? 'btn-primary' : 'btn-secondary'}`}
+            >
+              {paused ? 'Resume' : 'Pause'}
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto space-y-2 font-mono text-xs">
+            {events.length === 0 ? (
+              <div className="text-gray-500 text-center py-4">
+                {paused ? 'Event stream paused' : 'Waiting for events...'}
+              </div>
+            ) : (
+              events.map((event, index) => {
+                const payload = event.payload || {};
+                return (
+                  <div
+                    key={event.id || index}
+                    className="p-2 bg-gray-50 rounded border border-gray-200"
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-xs ${
+                          event.type?.includes('completed')
+                            ? 'bg-green-100 text-green-800'
+                            : event.type?.includes('failed')
+                            ? 'bg-red-100 text-red-800'
+                            : 'bg-blue-100 text-blue-800'
+                        }`}
+                      >
+                        {event.type}
+                      </span>
+                      <span className="text-gray-400">{formatTime(event.timestamp)}</span>
+                    </div>
+                    {payload.stage_name && (
+                      <div className="text-gray-600">Stage: {payload.stage_name}</div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+            <div ref={eventsEndRef} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

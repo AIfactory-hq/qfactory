@@ -564,7 +564,7 @@ export default function RunDetailPage() {
                       key={item.id}
                       className="p-2 bg-gray-50 rounded border border-gray-200 text-sm"
                     >
-                      <div className="flex items-center gap-2 mb-1">
+                      <div className="flex items-center gap-2 mb-1 flex-wrap">
                         <span
                           className={`badge text-xs ${
                             item.result.passed ? 'badge-passed' : 'badge-failed'
@@ -580,10 +580,29 @@ export default function RunDetailPage() {
                             {(item.result.duration_ms / 1000).toFixed(2)}s
                           </span>
                         )}
+                        {item.result.execution_id && (
+                          <span className="text-xs text-gray-400 font-mono">
+                            exec:{item.result.execution_id.substring(0, 12)}...
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs text-gray-500">
                         {formatDate(item.result.timestamp)}
-                        {item.result.evidence_path && (
+                        {item.result.evidence_path && item.result.execution_id && (
+                          <a
+                            href={api.getExecEvidenceZipUrl(
+                              runId,
+                              item.result.level,
+                              item.result.name || 'default',
+                              item.result.execution_id
+                            )}
+                            className="ml-2 text-indigo-600 hover:underline"
+                            download
+                          >
+                            evidence
+                          </a>
+                        )}
+                        {item.result.evidence_path && !item.result.execution_id && (
                           <a
                             href={api.getGateEvidenceZipUrl(
                               runId,

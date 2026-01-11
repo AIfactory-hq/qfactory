@@ -103,6 +103,7 @@ type StageStatus struct {
 type GateResult struct {
 	Level        string     `json:"level"` // PR0, PR1, PR2, PR3
 	Name         string     `json:"name,omitempty"`
+	ExecutionID  string     `json:"execution_id,omitempty"` // unique ID for this execution
 	Passed       bool       `json:"passed"`
 	Checks       []Check    `json:"checks"`
 	Timestamp    time.Time  `json:"timestamp"`
@@ -169,6 +170,8 @@ type TrustBreakdown struct {
 // GateEvidence holds raw evidence from a gate execution.
 type GateEvidence struct {
 	Level       string            `json:"level"`
+	Name        string            `json:"name,omitempty"`
+	ExecutionID string            `json:"execution_id,omitempty"`
 	Command     string            `json:"command"`
 	StartedAt   time.Time         `json:"started_at"`
 	EndedAt     time.Time         `json:"ended_at"`

@@ -126,6 +126,8 @@ func main() {
 	mux.HandleFunc("POST /runs/{id}/gates/pr3", server.handlePR3Gate)
 	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/evidence.zip", server.handleGetGateEvidenceZip)
 	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/files", server.handleGetGateFiles)
+	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/exec/{execId}/evidence.zip", server.handleGetExecEvidenceZip)
+	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/exec/{execId}/files", server.handleGetExecFiles)
 	mux.HandleFunc("GET /runs/{id}/evidence", server.handleGetEvidence)
 	mux.HandleFunc("GET /runs/{id}/evidence.zip", server.handleGetEvidenceZip)
 	mux.HandleFunc("POST /internal/events", server.handleInternalEvent)
@@ -770,6 +772,142 @@ func (s *Server) handleGetGateFiles(w http.ResponseWriter, r *http.Request) {
 		"level":  level,
 		"name":   name,
 		"files":  files,
+	})
+}
+
+func (s *Server) handleGetExecEvidenceZip(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	level := r.PathValue("level")
+	name := r.PathValue("name")
+	execId := r.PathValue("execId")
+
+	if id == "" || level == "" || name == "" || execId == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id, level, name, or execution id")
+		return
+	}
+
+	ctx := r.Context()
+	_, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Path with execution ID: evidence/<runID>/gates/<level>/<name>/<execID>/
+	execDir := filepath.Join(contracts.EvidenceDir, id, "gates", level, name, execId)
+	if _, err := os.Stat(execDir); os.IsNotExist(err) {
+		writeJSONError(w, http.StatusNotFound, "execution evidence not found")
+		return
+	}
+
+	// Create zip in memory
+	var buf bytes.Buffer
+	zipWriter := zip.NewWriter(&buf)
+
+	err = filepath.Walk(execDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(execDir, path)
+		if err != nil {
+			return err
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.Join(level, name, execId, relPath)
+		header.Method = zip.Deflate
+
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(writer, file)
+		return err
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create zip: %v", err))
+		return
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to finalize zip: %v", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-%s-%s-%s.zip\"", id, level, name, execId))
+	w.Write(buf.Bytes())
+}
+
+func (s *Server) handleGetExecFiles(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	level := r.PathValue("level")
+	name := r.PathValue("name")
+	execId := r.PathValue("execId")
+
+	if id == "" || level == "" || name == "" || execId == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id, level, name, or execution id")
+		return
+	}
+
+	ctx := r.Context()
+	_, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Path with execution ID: evidence/<runID>/gates/<level>/<name>/<execID>/
+	execDir := filepath.Join(contracts.EvidenceDir, id, "gates", level, name, execId)
+	if _, err := os.Stat(execDir); os.IsNotExist(err) {
+		writeJSONError(w, http.StatusNotFound, "execution evidence not found")
+		return
+	}
+
+	type fileInfo struct {
+		Name string `json:"name"`
+		Size int64  `json:"size"`
+	}
+
+	var files []fileInfo
+	err = filepath.Walk(execDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		relPath, _ := filepath.Rel(execDir, path)
+		files = append(files, fileInfo{Name: relPath, Size: info.Size()})
+		return nil
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list files: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"run_id":       id,
+		"level":        level,
+		"name":         name,
+		"execution_id": execId,
+		"files":        files,
 	})
 }
 

@@ -48,6 +48,10 @@ export const api = {
     return `${API_BASE}/runs/${id}/gates/${level}/${name}/evidence.zip`;
   },
 
+  getExecEvidenceZipUrl(id: string, level: string, name: string, execId: string): string {
+    return `${API_BASE}/runs/${id}/gates/${level}/${name}/exec/${execId}/evidence.zip`;
+  },
+
   getEvidenceManifest(id: string): Promise<unknown> {
     return fetchJSON<unknown>(`/runs/${id}/evidence`);
   },

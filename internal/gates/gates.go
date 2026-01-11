@@ -98,7 +98,7 @@ func (r *GateRunner) RunGateWithExecutor(ctx context.Context, runID string, gate
 
 	// Emit gate.started event
 	if r.publisher != nil {
-		startEvent := events.NewGateStartedEvent(runID, gate.Level(), gateName, executorName, startTime)
+		startEvent := events.NewGateStartedEvent(runID, gate.Level(), gateName, executorName, executionID, startTime)
 		if err := r.publisher.PublishEvent(ctx, startEvent); err != nil {
 			fmt.Printf("Warning: failed to publish gate.started event: %v\n", err)
 		}
@@ -121,6 +121,7 @@ func (r *GateRunner) RunGateWithExecutor(ctx context.Context, runID string, gate
 			Result: contracts.GateResult{
 				Level:       gate.Level(),
 				Name:        gateName,
+				ExecutionID: executionID,
 				Passed:      false,
 				Executor:    executorName,
 				Timestamp:   endTime,
@@ -140,8 +141,8 @@ func (r *GateRunner) RunGateWithExecutor(ctx context.Context, runID string, gate
 			failOutput.Stderr = runErr.Error()
 		}
 
-		// Write evidence even on failure
-		evidencePath, _ := r.writeGateEvidence(runID, gate.Level(), gateName, failOutput)
+		// Write evidence even on failure (keyed by executionID for immutability)
+		evidencePath, _ := r.writeGateEvidence(runID, gate.Level(), gateName, executionID, failOutput)
 		failOutput.Result.EvidencePath = evidencePath
 
 		// Persist to history table
@@ -152,7 +153,7 @@ func (r *GateRunner) RunGateWithExecutor(ctx context.Context, runID string, gate
 
 		// Emit gate.failed event
 		if r.publisher != nil {
-			failEvent := events.NewGateFailedEvent(runID, gate.Level(), gateName, executorName, runErr.Error(), startTime, durationMs)
+			failEvent := events.NewGateFailedEvent(runID, gate.Level(), gateName, executorName, executionID, runErr.Error(), startTime, durationMs)
 			if err := r.publisher.PublishEvent(ctx, failEvent); err != nil {
 				fmt.Printf("Warning: failed to publish gate.failed event: %v\n", err)
 			}
@@ -161,14 +162,15 @@ func (r *GateRunner) RunGateWithExecutor(ctx context.Context, runID string, gate
 		return failOutput.Result, fmt.Errorf("gate execution failed: %w", runErr)
 	}
 
-	// Normalize name and executor in output result
+	// Normalize name, executor, and execution ID in output result
 	output.Result.Name = gateName
+	output.Result.ExecutionID = executionID
 	if output.Result.Executor == "" {
 		output.Result.Executor = executorName
 	}
 
-	// Write all evidence files
-	evidencePath, writeErr := r.writeGateEvidence(runID, gate.Level(), gateName, output)
+	// Write all evidence files (keyed by executionID for immutability)
+	evidencePath, writeErr := r.writeGateEvidence(runID, gate.Level(), gateName, executionID, output)
 	if writeErr != nil {
 		fmt.Printf("Warning: failed to write evidence: %v\n", writeErr)
 	}
@@ -187,7 +189,7 @@ func (r *GateRunner) RunGateWithExecutor(ctx context.Context, runID string, gate
 	// Emit gate.completed event
 	if r.publisher != nil {
 		completeEvent := events.NewGateCompletedEvent(
-			runID, gate.Level(), gateName, output.Result.Executor,
+			runID, gate.Level(), gateName, output.Result.Executor, executionID,
 			output.Result.Passed, evidencePath,
 			startTime, endTime, output.Result.DurationMs,
 		)
@@ -200,8 +202,10 @@ func (r *GateRunner) RunGateWithExecutor(ctx context.Context, runID string, gate
 }
 
 // writeGateEvidence writes all evidence files for a gate execution.
-func (r *GateRunner) writeGateEvidence(runID, level, gateName string, output GateOutput) (string, error) {
-	gateDir := filepath.Join(r.evidenceDir, runID, "gates", level, gateName)
+// Evidence is keyed by executionID to ensure immutability on re-runs.
+func (r *GateRunner) writeGateEvidence(runID, level, gateName, executionID string, output GateOutput) (string, error) {
+	// Path: evidence/<runID>/gates/<level>/<name>/<executionID>/
+	gateDir := filepath.Join(r.evidenceDir, runID, "gates", level, gateName, executionID)
 	if err := os.MkdirAll(gateDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create gate dir: %w", err)
 	}
@@ -225,6 +229,7 @@ func (r *GateRunner) writeGateEvidence(runID, level, gateName string, output Gat
 	resultData := map[string]interface{}{
 		"level":        output.Result.Level,
 		"name":         output.Result.Name,
+		"execution_id": executionID,
 		"passed":       output.Result.Passed,
 		"executor":     output.Result.Executor,
 		"duration_ms":  output.Result.DurationMs,

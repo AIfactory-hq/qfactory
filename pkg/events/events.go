@@ -57,6 +57,7 @@ type GateInfo struct {
 // GatePayload is the payload for gate events.
 type GatePayload struct {
 	Gate         GateInfo `json:"gate"`
+	ExecutionID  string   `json:"execution_id,omitempty"`
 	Passed       bool     `json:"passed,omitempty"`
 	EvidencePath string   `json:"evidence_path,omitempty"`
 	Error        string   `json:"error,omitempty"`
@@ -110,14 +111,15 @@ func NewID() string {
 }
 
 // NewGateStartedEvent creates a gate.started event.
-func NewGateStartedEvent(runID, level, name, executor string, startedAt time.Time) Event {
+func NewGateStartedEvent(runID, level, name, executor, executionID string, startedAt time.Time) Event {
 	payload, _ := json.Marshal(GatePayload{
 		Gate: GateInfo{
 			Level:    level,
 			Name:     name,
 			Executor: executor,
 		},
-		StartedAt: startedAt.Format(time.RFC3339),
+		ExecutionID: executionID,
+		StartedAt:   startedAt.Format(time.RFC3339),
 	})
 	return Event{
 		ID:        generateEventID(),
@@ -129,13 +131,14 @@ func NewGateStartedEvent(runID, level, name, executor string, startedAt time.Tim
 }
 
 // NewGateCompletedEvent creates a gate.completed event.
-func NewGateCompletedEvent(runID, level, name, executor string, passed bool, evidencePath string, startedAt, completedAt time.Time, durationMs int64) Event {
+func NewGateCompletedEvent(runID, level, name, executor, executionID string, passed bool, evidencePath string, startedAt, completedAt time.Time, durationMs int64) Event {
 	payload, _ := json.Marshal(GatePayload{
 		Gate: GateInfo{
 			Level:    level,
 			Name:     name,
 			Executor: executor,
 		},
+		ExecutionID:  executionID,
 		Passed:       passed,
 		EvidencePath: evidencePath,
 		StartedAt:    startedAt.Format(time.RFC3339),
@@ -152,7 +155,7 @@ func NewGateCompletedEvent(runID, level, name, executor string, passed bool, evi
 }
 
 // NewGateFailedEvent creates a gate.failed event.
-func NewGateFailedEvent(runID, level, name, executor string, errMsg string, startedAt time.Time, durationMs int64) Event {
+func NewGateFailedEvent(runID, level, name, executor, executionID string, errMsg string, startedAt time.Time, durationMs int64) Event {
 	completedAt := time.Now().UTC()
 	payload, _ := json.Marshal(GatePayload{
 		Gate: GateInfo{
@@ -160,6 +163,7 @@ func NewGateFailedEvent(runID, level, name, executor string, errMsg string, star
 			Name:     name,
 			Executor: executor,
 		},
+		ExecutionID: executionID,
 		Passed:      false,
 		Error:       errMsg,
 		StartedAt:   startedAt.Format(time.RFC3339),

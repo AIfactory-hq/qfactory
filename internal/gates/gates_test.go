@@ -203,8 +203,11 @@ func TestGateRunnerPersistence(t *testing.T) {
 		t.Errorf("expected 1 gate, got %d", len(gates))
 	}
 
-	// Verify evidence files
-	resultPath := filepath.Join(tmpDir, run.ID, "gates", "PR2", "test_gate", "result.json")
+	// Verify evidence files using the evidence path from result (includes execution_id)
+	if result.EvidencePath == "" {
+		t.Fatal("expected evidence_path to be set")
+	}
+	resultPath := filepath.Join(result.EvidencePath, "result.json")
 	data, err := os.ReadFile(resultPath)
 	if err != nil {
 		t.Fatalf("failed to read result.json: %v", err)
@@ -217,9 +220,14 @@ func TestGateRunnerPersistence(t *testing.T) {
 		t.Error("result.json passed should be true")
 	}
 
-	cmdPath := filepath.Join(tmpDir, run.ID, "gates", "PR2", "test_gate", "command.txt")
+	cmdPath := filepath.Join(result.EvidencePath, "command.txt")
 	if _, err := os.Stat(cmdPath); os.IsNotExist(err) {
 		t.Error("command.txt should exist")
+	}
+
+	// Verify execution_id is set
+	if result.ExecutionID == "" {
+		t.Error("expected execution_id to be set")
 	}
 }
 
@@ -674,5 +682,178 @@ func TestGateRunnerWithExecutor(t *testing.T) {
 	// Since the mockGate returns "mock", the executor preserves that unless empty
 	if result.Executor != "mock" {
 		t.Errorf("expected executor 'mock', got '%s'", result.Executor)
+	}
+}
+
+func TestEvidenceImmutabilityPerExecution(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gates_test_immutability")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	store := newMockStore()
+	runner := NewGateRunner(store, tmpDir)
+
+	run := &contracts.WorkflowRun{
+		ID:        "test-run-immutability",
+		Status:    contracts.RunStatusCompleted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	store.CreateRun(context.Background(), run)
+
+	gate := &mockGate{level: "PR2", name: "test_gate", passed: true}
+
+	// Execute gate multiple times
+	result1, err := runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("first RunGate failed: %v", err)
+	}
+
+	result2, err := runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("second RunGate failed: %v", err)
+	}
+
+	result3, err := runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("third RunGate failed: %v", err)
+	}
+
+	// Verify each execution has a unique execution_id
+	if result1.ExecutionID == "" {
+		t.Error("first result should have execution_id")
+	}
+	if result2.ExecutionID == "" {
+		t.Error("second result should have execution_id")
+	}
+	if result3.ExecutionID == "" {
+		t.Error("third result should have execution_id")
+	}
+
+	if result1.ExecutionID == result2.ExecutionID {
+		t.Error("execution IDs should be unique between runs")
+	}
+	if result2.ExecutionID == result3.ExecutionID {
+		t.Error("execution IDs should be unique between runs")
+	}
+
+	// Verify each execution has a separate evidence directory
+	if result1.EvidencePath == result2.EvidencePath {
+		t.Error("evidence paths should be unique between runs")
+	}
+	if result2.EvidencePath == result3.EvidencePath {
+		t.Error("evidence paths should be unique between runs")
+	}
+
+	// Verify all evidence directories exist
+	for i, path := range []string{result1.EvidencePath, result2.EvidencePath, result3.EvidencePath} {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Errorf("evidence directory %d does not exist: %s", i+1, path)
+		}
+	}
+
+	// Verify history has 3 separate entries
+	history := store.gateHistory[run.ID]
+	if len(history) != 3 {
+		t.Errorf("expected 3 history entries, got %d", len(history))
+	}
+
+	// Verify each history entry has unique ID and execution_id
+	ids := make(map[string]bool)
+	execIds := make(map[string]bool)
+	for _, item := range history {
+		if ids[item.ID] {
+			t.Errorf("duplicate history ID: %s", item.ID)
+		}
+		ids[item.ID] = true
+
+		if execIds[item.Result.ExecutionID] {
+			t.Errorf("duplicate execution_id in history: %s", item.Result.ExecutionID)
+		}
+		execIds[item.Result.ExecutionID] = true
+	}
+
+	// Verify latest view still has only 1 gate (replace semantics)
+	gates := store.gates[run.ID]
+	if len(gates) != 1 {
+		t.Errorf("expected 1 gate in latest view (replaced), got %d", len(gates))
+	}
+
+	// Verify all 3 evidence directories contain result.json with unique execution_ids
+	for _, path := range []string{result1.EvidencePath, result2.EvidencePath, result3.EvidencePath} {
+		resultPath := filepath.Join(path, "result.json")
+		data, err := os.ReadFile(resultPath)
+		if err != nil {
+			t.Errorf("failed to read result.json at %s: %v", path, err)
+			continue
+		}
+
+		var resultJSON map[string]interface{}
+		if err := json.Unmarshal(data, &resultJSON); err != nil {
+			t.Errorf("failed to parse result.json at %s: %v", path, err)
+			continue
+		}
+
+		if resultJSON["execution_id"] == nil || resultJSON["execution_id"] == "" {
+			t.Errorf("result.json at %s missing execution_id", path)
+		}
+	}
+}
+
+func TestExecutionIDInEvents(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gates_test_events")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	store := newMockStore()
+	publisher := newMockEventPublisher()
+	runner := NewGateRunner(store, tmpDir)
+	runner.SetEventPublisher(publisher)
+
+	run := &contracts.WorkflowRun{
+		ID:        "test-run-event-execid",
+		Status:    contracts.RunStatusCompleted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	store.CreateRun(context.Background(), run)
+
+	gate := &mockGate{level: "PR2", name: "test_gate", passed: true}
+	result, err := runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("RunGate failed: %v", err)
+	}
+
+	// Verify events contain execution_id
+	if len(publisher.events) != 2 {
+		t.Fatalf("expected 2 events, got %d", len(publisher.events))
+	}
+
+	// Parse started event payload
+	var startPayload events.GatePayload
+	if err := json.Unmarshal(publisher.events[0].Payload, &startPayload); err != nil {
+		t.Fatalf("failed to parse started event payload: %v", err)
+	}
+	if startPayload.ExecutionID == "" {
+		t.Error("started event should contain execution_id")
+	}
+	if startPayload.ExecutionID != result.ExecutionID {
+		t.Error("started event execution_id should match result execution_id")
+	}
+
+	// Parse completed event payload
+	var completePayload events.GatePayload
+	if err := json.Unmarshal(publisher.events[1].Payload, &completePayload); err != nil {
+		t.Fatalf("failed to parse completed event payload: %v", err)
+	}
+	if completePayload.ExecutionID == "" {
+		t.Error("completed event should contain execution_id")
+	}
+	if completePayload.ExecutionID != result.ExecutionID {
+		t.Error("completed event execution_id should match result execution_id")
 	}
 }

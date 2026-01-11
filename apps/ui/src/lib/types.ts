@@ -15,6 +15,7 @@ export interface Check {
 export interface GateResult {
   level: string;
   name?: string;
+  execution_id?: string;
   passed: boolean;
   checks?: Check[];
   timestamp?: string;

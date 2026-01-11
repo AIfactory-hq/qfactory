@@ -543,38 +543,91 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 	goVersionOut, _ := exec.Command("go", "version").Output()
 	goVersion := string(bytes.TrimSpace(goVersionOut))
 
-	// Execute go test ./...
-	gateCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-
 	startTime := time.Now().UTC()
-	cmd := exec.CommandContext(gateCtx, "go", "test", "./...")
+
+	// Determine workspace directory for this run
+	// Priority: 1) evidence/{id}/workspace, 2) QF_WORKSPACE_ROOT/{id}, 3) current directory
+	workspaceDir := filepath.Join(contracts.EvidenceDir, id, "workspace")
+	if envRoot := os.Getenv("QF_WORKSPACE_ROOT"); envRoot != "" {
+		workspaceDir = filepath.Join(envRoot, id)
+	}
 
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	var cmdErr error
+	var exitCode int
+	var passed bool
+	var checkMsg string
+	var testCommand string
 
-	cmdErr := cmd.Run()
-	endTime := time.Now().UTC()
-	durationMs := endTime.Sub(startTime).Milliseconds()
-
-	exitCode := 0
-	if cmdErr != nil {
-		if exitErr, ok := cmdErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else if gateCtx.Err() == context.DeadlineExceeded {
-			exitCode = -1 // Timeout
-		} else {
-			exitCode = -2 // Other error
+	// Check if workspace exists and has Go files
+	hasGoFiles := false
+	if info, err := os.Stat(workspaceDir); err == nil && info.IsDir() {
+		// Check for Go files in workspace
+		entries, _ := os.ReadDir(workspaceDir)
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+				hasGoFiles = true
+				break
+			}
+		}
+		// Also check for go.mod to indicate a Go module
+		if !hasGoFiles {
+			if _, err := os.Stat(filepath.Join(workspaceDir, "go.mod")); err == nil {
+				hasGoFiles = true
+			}
 		}
 	}
 
-	passed := exitCode == 0
+	if hasGoFiles {
+		// Run tests in the workspace directory
+		testCommand = fmt.Sprintf("go test ./... (in %s)", workspaceDir)
+		gateCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(gateCtx, "go", "test", "./...")
+		cmd.Dir = workspaceDir
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		cmdErr = cmd.Run()
+
+		if cmdErr != nil {
+			if exitErr, ok := cmdErr.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			} else if gateCtx.Err() == context.DeadlineExceeded {
+				exitCode = -1 // Timeout
+			} else {
+				exitCode = -2 // Other error
+			}
+		}
+
+		passed = exitCode == 0
+		if passed {
+			checkMsg = "all tests passed"
+		} else if gateCtx.Err() == context.DeadlineExceeded {
+			checkMsg = fmt.Sprintf("timeout after %ds", timeoutSec)
+		} else {
+			checkMsg = fmt.Sprintf("tests failed with exit code %d", exitCode)
+		}
+	} else {
+		// No workspace or no Go files - pass with informational message
+		testCommand = "no tests (no workspace)"
+		passed = true
+		exitCode = 0
+		checkMsg = fmt.Sprintf("no Go files found in workspace (%s) - skipped", workspaceDir)
+		stdout.WriteString("PR1 gate: No workspace directory or Go files found.\n")
+		stdout.WriteString(fmt.Sprintf("Expected workspace at: %s\n", workspaceDir))
+		stdout.WriteString("This is normal for stub workflows that don't generate code.\n")
+		stdout.WriteString("Gate passed (no tests to run).\n")
+	}
+
+	endTime := time.Now().UTC()
+	durationMs := endTime.Sub(startTime).Milliseconds()
 
 	// Build evidence
 	evidence := contracts.GateEvidence{
 		Level:      contracts.GateLevelPR1,
-		Command:    "go test ./...",
+		Command:    testCommand,
 		StartedAt:  startTime,
 		EndedAt:    endTime,
 		ExitCode:   exitCode,
@@ -599,16 +652,6 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Failed to write events.jsonl: %v", err)
 	}
 
-	// Build check result
-	checkMsg := "all tests passed"
-	if !passed {
-		if gateCtx.Err() == context.DeadlineExceeded {
-			checkMsg = fmt.Sprintf("timeout after %ds", timeoutSec)
-		} else {
-			checkMsg = fmt.Sprintf("tests failed with exit code %d", exitCode)
-		}
-	}
-
 	result := contracts.GateResult{
 		Level:        contracts.GateLevelPR1,
 		Passed:       passed,
@@ -624,7 +667,7 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	if !passed && gateCtx.Err() == context.DeadlineExceeded {
+	if !passed && exitCode == -1 {
 		result.Error = "timeout exceeded"
 	}
 

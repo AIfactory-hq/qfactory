@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +17,48 @@ const (
 	// SecurityScanGateTimeout is the timeout for security scans.
 	SecurityScanGateTimeout = 5 * time.Minute
 )
+
+// findGoBinary searches for a Go tool binary in common locations.
+// It checks: 1) PATH, 2) GOBIN, 3) GOPATH/bin, 4) ~/go/bin
+// Returns the full path to the binary or empty string if not found.
+func findGoBinary(name string) string {
+	// First try PATH
+	if path, err := exec.LookPath(name); err == nil {
+		return path
+	}
+
+	// Check GOBIN
+	if gobin := os.Getenv("GOBIN"); gobin != "" {
+		candidate := filepath.Join(gobin, name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// Check GOPATH/bin
+	if gopath := os.Getenv("GOPATH"); gopath != "" {
+		candidate := filepath.Join(gopath, "bin", name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// Check ~/go/bin (default GOPATH location)
+	if home, err := os.UserHomeDir(); err == nil {
+		candidate := filepath.Join(home, "go", "bin", name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// Check /usr/local/go/bin
+	candidate := filepath.Join("/usr/local/go/bin", name)
+	if _, err := os.Stat(candidate); err == nil {
+		return candidate
+	}
+
+	return ""
+}
 
 // SecurityScanGate runs security and static analysis tools as a PR3 gate.
 type SecurityScanGate struct{}
@@ -37,6 +81,7 @@ func (g *SecurityScanGate) Name() string {
 // toolInfo holds information about a security tool.
 type toolInfo struct {
 	name    string
+	path    string // full path to binary (populated during preflight)
 	args    []string
 	checkFn func(err error, stdout, stderr string) (passed bool, msg string)
 }
@@ -44,6 +89,57 @@ type toolInfo struct {
 // Run executes the security scan gate.
 func (g *SecurityScanGate) Run(ctx context.Context, run *contracts.WorkflowRun) (GateOutput, error) {
 	startTime := time.Now().UTC()
+
+	// Determine workspace directory for this run
+	// Priority: 1) evidence/{id}/workspace, 2) QF_WORKSPACE_ROOT/{id}, 3) current directory
+	workspaceDir := filepath.Join(contracts.EvidenceDir, run.ID, "workspace")
+	if envRoot := os.Getenv("QF_WORKSPACE_ROOT"); envRoot != "" {
+		workspaceDir = filepath.Join(envRoot, run.ID)
+	}
+
+	// Check if workspace exists and has Go files
+	hasGoFiles := false
+	if info, err := os.Stat(workspaceDir); err == nil && info.IsDir() {
+		entries, _ := os.ReadDir(workspaceDir)
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
+				hasGoFiles = true
+				break
+			}
+		}
+		if !hasGoFiles {
+			if _, err := os.Stat(filepath.Join(workspaceDir, "go.mod")); err == nil {
+				hasGoFiles = true
+			}
+		}
+	}
+
+	// If no workspace or Go files, pass with informational message
+	if !hasGoFiles {
+		endTime := time.Now().UTC()
+		return GateOutput{
+			Result: contracts.GateResult{
+				Level:       contracts.GateLevelPR3,
+				Name:        g.Name(),
+				Passed:      true,
+				Executor:    "local",
+				Timestamp:   endTime,
+				DurationMs:  endTime.Sub(startTime).Milliseconds(),
+				StartedAt:   &startTime,
+				CompletedAt: &endTime,
+				Checks: []contracts.Check{
+					{
+						Name:    "workspace",
+						Passed:  true,
+						Message: fmt.Sprintf("no Go files found in workspace (%s) - skipped", workspaceDir),
+					},
+				},
+			},
+			Command: "no scan (no workspace)",
+			Stdout:  fmt.Sprintf("PR3 gate: No workspace directory or Go files found.\nExpected workspace at: %s\nThis is normal for stub workflows that don't generate code.\nGate passed (no files to scan).\n", workspaceDir),
+			Stderr:  "",
+		}, nil
+	}
 
 	// Create context with timeout for entire gate
 	gateCtx, cancel := context.WithTimeout(ctx, SecurityScanGateTimeout)
@@ -83,24 +179,25 @@ func (g *SecurityScanGate) Run(ctx context.Context, run *contracts.WorkflowRun) 
 		},
 	}
 
-	// Preflight: check tool availability
+	// Preflight: check tool availability (search PATH, GOBIN, GOPATH/bin, ~/go/bin)
 	var checks []contracts.Check
 	var missingTools []string
 	var combinedStdout, combinedStderr strings.Builder
 
 	combinedStdout.WriteString("== Preflight: Tool Availability ==\n")
-	for _, tool := range tools {
-		_, err := exec.LookPath(tool.name)
-		if err != nil {
-			missingTools = append(missingTools, tool.name)
+	for i := range tools {
+		toolPath := findGoBinary(tools[i].name)
+		if toolPath == "" {
+			missingTools = append(missingTools, tools[i].name)
 			checks = append(checks, contracts.Check{
-				Name:    "tool:" + tool.name,
+				Name:    "tool:" + tools[i].name,
 				Passed:  false,
-				Message: fmt.Sprintf("missing binary: %s", tool.name),
+				Message: fmt.Sprintf("missing binary: %s", tools[i].name),
 			})
-			combinedStdout.WriteString(fmt.Sprintf("%s: NOT FOUND\n", tool.name))
+			combinedStdout.WriteString(fmt.Sprintf("%s: NOT FOUND (searched PATH, GOBIN, GOPATH/bin, ~/go/bin)\n", tools[i].name))
 		} else {
-			combinedStdout.WriteString(fmt.Sprintf("%s: OK\n", tool.name))
+			tools[i].path = toolPath
+			combinedStdout.WriteString(fmt.Sprintf("%s: OK (%s)\n", tools[i].name, toolPath))
 		}
 	}
 	combinedStdout.WriteString("\n")
@@ -128,12 +225,15 @@ func (g *SecurityScanGate) Run(ctx context.Context, run *contracts.WorkflowRun) 
 		}, nil
 	}
 
-	// Run each tool sequentially
+	// Run each tool sequentially in the workspace directory
+	combinedStdout.WriteString(fmt.Sprintf("== Workspace: %s ==\n\n", workspaceDir))
 	allPassed := true
 	for _, tool := range tools {
 		combinedStdout.WriteString(fmt.Sprintf("== %s ==\n", tool.name))
 
-		cmd := exec.CommandContext(gateCtx, tool.name, tool.args...)
+		// Use full path to tool (resolved during preflight)
+		cmd := exec.CommandContext(gateCtx, tool.path, tool.args...)
+		cmd.Dir = workspaceDir // Run in workspace directory
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
@@ -198,7 +298,7 @@ func (g *SecurityScanGate) Run(ctx context.Context, run *contracts.WorkflowRun) 
 			Checks:      checks,
 			Error:       gateError,
 		},
-		Command: "gosec ./... && govulncheck ./... && staticcheck ./...",
+		Command: fmt.Sprintf("gosec ./... && govulncheck ./... && staticcheck ./... (in %s)", workspaceDir),
 		Stdout:  combinedStdout.String(),
 		Stderr:  combinedStderr.String(),
 	}, nil

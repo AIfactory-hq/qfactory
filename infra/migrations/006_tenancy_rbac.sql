@@ -17,21 +17,15 @@ CREATE INDEX IF NOT EXISTS idx_runs_tenant_id ON runs (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_runs_project_id ON runs (project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_tenant_project ON runs (tenant_id, project_id);
 
--- Add tenancy to events table
-ALTER TABLE events ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
-ALTER TABLE events ADD COLUMN IF NOT EXISTS project_id TEXT NOT NULL DEFAULT 'default';
+-- Add tenancy to run_events table
+ALTER TABLE run_events ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE run_events ADD COLUMN IF NOT EXISTS project_id TEXT NOT NULL DEFAULT 'default';
 
-CREATE INDEX IF NOT EXISTS idx_events_tenant_id ON events (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_run_events_tenant_id ON run_events (tenant_id);
 
--- Add tenancy to gate_history table
-ALTER TABLE gate_history ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
-ALTER TABLE gate_history ADD COLUMN IF NOT EXISTS project_id TEXT NOT NULL DEFAULT 'default';
-
-CREATE INDEX IF NOT EXISTS idx_gate_history_tenant_id ON gate_history (tenant_id);
-
--- Add tenancy to gate_results table (latest view)
-ALTER TABLE gate_results ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
-ALTER TABLE gate_results ADD COLUMN IF NOT EXISTS project_id TEXT NOT NULL DEFAULT 'default';
+-- Add tenancy to run_gate_results table (latest view)
+ALTER TABLE run_gate_results ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE run_gate_results ADD COLUMN IF NOT EXISTS project_id TEXT NOT NULL DEFAULT 'default';
 
 -- Add extended policy fields to runs (stored as part of gate_policy JSONB)
 -- These are already JSON fields so no schema change needed, just documenting:

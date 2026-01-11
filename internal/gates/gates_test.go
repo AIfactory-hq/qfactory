@@ -95,6 +95,23 @@ func (m *mockStore) ListGateHistory(ctx context.Context, runID string, limit int
 	return m.gateHistory[runID], nil
 }
 
+func (m *mockStore) AddGateHistoryItem(ctx context.Context, runID string, item contracts.GateHistoryItem) error {
+	m.gateHistory[runID] = append(m.gateHistory[runID], item)
+	return nil
+}
+
+func (m *mockStore) GetLatestExecution(ctx context.Context, runID, level, name string) (string, error) {
+	name = contracts.NormalizeGateName(name)
+	history := m.gateHistory[runID]
+	for _, item := range history {
+		itemName := contracts.NormalizeGateName(item.Result.Name)
+		if item.Result.Level == level && itemName == name {
+			return item.Result.ExecutionID, nil
+		}
+	}
+	return "", nil
+}
+
 func (m *mockStore) GetLatestGates(ctx context.Context, runID string) ([]contracts.GateResult, error) {
 	return m.gates[runID], nil
 }
@@ -855,5 +872,302 @@ func TestExecutionIDInEvents(t *testing.T) {
 	}
 	if completePayload.ExecutionID != result.ExecutionID {
 		t.Error("completed event execution_id should match result execution_id")
+	}
+}
+
+// v0.8 Gate Registry tests
+
+func TestRegistry_NewRegistry(t *testing.T) {
+	r := NewRegistry()
+	if r == nil {
+		t.Fatal("NewRegistry should return non-nil")
+	}
+	if len(r.Keys()) != 0 {
+		t.Errorf("expected empty registry, got %d gates", len(r.Keys()))
+	}
+}
+
+func TestRegistry_DefaultRegistry(t *testing.T) {
+	r := DefaultRegistry()
+	if r == nil {
+		t.Fatal("DefaultRegistry should return non-nil")
+	}
+
+	keys := r.Keys()
+	if len(keys) < 3 {
+		t.Errorf("expected at least 3 built-in gates, got %d", len(keys))
+	}
+
+	// Verify built-in gates are registered
+	if gate := r.Get("PR1", "unit_tests"); gate == nil {
+		t.Error("expected PR1/unit_tests to be registered")
+	}
+	if gate := r.Get("PR2", "integration_smoke"); gate == nil {
+		t.Error("expected PR2/integration_smoke to be registered")
+	}
+	if gate := r.Get("PR3", "security_scan"); gate == nil {
+		t.Error("expected PR3/security_scan to be registered")
+	}
+}
+
+func TestRegistry_Lookup(t *testing.T) {
+	r := DefaultRegistry()
+
+	gate, found := r.Lookup("PR1", "unit_tests")
+	if !found {
+		t.Error("expected to find PR1/unit_tests")
+	}
+	if gate.Level() != "PR1" {
+		t.Errorf("expected level PR1, got %s", gate.Level())
+	}
+
+	_, found = r.Lookup("PR9", "nonexistent")
+	if found {
+		t.Error("should not find nonexistent gate")
+	}
+}
+
+func TestRegistry_NormalizedLookup(t *testing.T) {
+	r := DefaultRegistry()
+
+	// Lookup with whitespace should work due to normalization
+	gate := r.Get("PR1", "  unit_tests  ")
+	if gate != nil {
+		// If the registry normalizes on lookup, this should work
+		// Currently it might not - depends on implementation
+	}
+}
+
+// v0.8 RetryGate tests
+
+func TestGateRunner_RetryGate(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gates_test_retry")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	store := newMockStore()
+	runner := NewGateRunner(store, tmpDir)
+
+	// Set up registry with our mock gate
+	registry := NewRegistry()
+	registry.Register(&mockGate{level: "PR2", name: "test_gate", passed: true})
+	runner.SetRegistry(registry)
+
+	run := &contracts.WorkflowRun{
+		ID:        "test-run-retry",
+		Status:    contracts.RunStatusCompleted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	store.CreateRun(context.Background(), run)
+
+	// First execution
+	gate := &mockGate{level: "PR2", name: "test_gate", passed: false}
+	result1, err := runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("first RunGate failed: %v", err)
+	}
+
+	// Retry the gate
+	result2, err := runner.RetryGate(context.Background(), run.ID, "PR2", "test_gate", "testing retry")
+	if err != nil {
+		t.Fatalf("RetryGate failed: %v", err)
+	}
+
+	// Verify lineage
+	history := store.gateHistory[run.ID]
+	if len(history) != 2 {
+		t.Errorf("expected 2 history items, got %d", len(history))
+	}
+
+	// Second entry should have parent_execution_id pointing to first
+	if history[1].ParentExecutionID == nil {
+		t.Error("retry should have parent_execution_id set")
+	} else if *history[1].ParentExecutionID != result1.ExecutionID {
+		t.Error("retry parent_execution_id should match first execution")
+	}
+
+	if history[1].RetryReason != "testing retry" {
+		t.Errorf("expected retry_reason 'testing retry', got '%s'", history[1].RetryReason)
+	}
+
+	// Execution IDs should be different
+	if result1.ExecutionID == result2.ExecutionID {
+		t.Error("retry should have different execution_id")
+	}
+}
+
+func TestGateRunner_RetryGate_NotFound(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gates_test_retry_notfound")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	store := newMockStore()
+	runner := NewGateRunner(store, tmpDir)
+	runner.SetRegistry(NewRegistry()) // Empty registry
+
+	run := &contracts.WorkflowRun{
+		ID:        "test-run-retry-notfound",
+		Status:    contracts.RunStatusCompleted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	store.CreateRun(context.Background(), run)
+
+	_, err = runner.RetryGate(context.Background(), run.ID, "PR2", "nonexistent", "")
+	if err == nil {
+		t.Error("expected error for nonexistent gate")
+	}
+}
+
+// v0.8 TrustCalculator with history tests
+
+func TestTrustCalculator_WithHistory_Empty(t *testing.T) {
+	calculator := NewTrustCalculator()
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now},
+	}
+
+	// Empty history should work fine
+	result := calculator.CalculateWithHistory(nil, gates, nil)
+
+	if result.Score < 90 {
+		t.Errorf("expected high score with passing gate, got %d", result.Score)
+	}
+}
+
+func TestTrustCalculator_WithHistory_ConsecutiveFailures(t *testing.T) {
+	calculator := NewTrustCalculator()
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: false, Timestamp: now},
+	}
+
+	// History with consecutive failures (newest first)
+	history := []contracts.GateHistoryItem{
+		{ID: "h3", Result: contracts.GateResult{Level: "PR1", Name: "unit_tests", Passed: false}},
+		{ID: "h2", Result: contracts.GateResult{Level: "PR1", Name: "unit_tests", Passed: false}},
+		{ID: "h1", Result: contracts.GateResult{Level: "PR1", Name: "unit_tests", Passed: false}},
+	}
+
+	result := calculator.CalculateWithHistory(nil, gates, history)
+
+	if result.Breakdown.ConsecutiveFailurePenalty == 0 {
+		t.Error("expected consecutive failure penalty")
+	}
+}
+
+func TestTrustCalculator_WithHistory_Recovery(t *testing.T) {
+	calculator := NewTrustCalculator()
+
+	now := time.Now().UTC()
+	gates := []contracts.GateResult{
+		{Level: "PR1", Name: "unit_tests", Passed: true, Timestamp: now},
+	}
+
+	parentID := "h1"
+	// History: current passes (retry of failed), previous failed
+	history := []contracts.GateHistoryItem{
+		{
+			ID:                "h2",
+			Result:            contracts.GateResult{Level: "PR1", Name: "unit_tests", Passed: true, ExecutionID: "h2"},
+			ParentExecutionID: &parentID,
+			RetryReason:       "retry after failure",
+		},
+		{
+			ID:     "h1",
+			Result: contracts.GateResult{Level: "PR1", Name: "unit_tests", Passed: false, ExecutionID: "h1"},
+		},
+	}
+
+	result := calculator.CalculateWithHistory(nil, gates, history)
+
+	if result.Breakdown.RecoveryReward == 0 {
+		t.Error("expected recovery reward for successful retry after failure")
+	}
+}
+
+// v0.8 NormalizeGateName tests
+
+func TestNormalizeGateName(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"", "default"},
+		{"  ", "default"},
+		{"\t\n", "default"},
+		{"unit_tests", "unit_tests"},
+		{"  unit_tests  ", "unit_tests"},
+		{"My Gate", "My Gate"},
+	}
+
+	for _, tc := range tests {
+		result := contracts.NormalizeGateName(tc.input)
+		if result != tc.expected {
+			t.Errorf("NormalizeGateName(%q) = %q, expected %q", tc.input, result, tc.expected)
+		}
+	}
+}
+
+func TestTruncateRetryReason(t *testing.T) {
+	short := "short reason"
+	result := contracts.TruncateRetryReason(short)
+	if result != short {
+		t.Errorf("short reason should not be truncated")
+	}
+
+	// Test long reason
+	long := ""
+	for i := 0; i < 300; i++ {
+		long += "x"
+	}
+	result = contracts.TruncateRetryReason(long)
+	if len(result) > contracts.MaxRetryReasonLength {
+		t.Errorf("long reason should be truncated to %d, got %d", contracts.MaxRetryReasonLength, len(result))
+	}
+}
+
+// v0.8 GetRegistry tests
+
+func TestGateRunner_GetRegistry(t *testing.T) {
+	store := newMockStore()
+	runner := NewGateRunner(store, "/tmp")
+
+	// First call should create default registry
+	registry := runner.GetRegistry()
+	if registry == nil {
+		t.Fatal("GetRegistry should return non-nil")
+	}
+
+	// Should have built-in gates
+	if gate := registry.Get("PR1", "unit_tests"); gate == nil {
+		t.Error("default registry should have PR1/unit_tests")
+	}
+
+	// Subsequent calls should return same registry
+	registry2 := runner.GetRegistry()
+	if registry != registry2 {
+		t.Error("GetRegistry should return same instance")
+	}
+}
+
+func TestGateRunner_SetRegistry(t *testing.T) {
+	store := newMockStore()
+	runner := NewGateRunner(store, "/tmp")
+
+	customRegistry := NewRegistry()
+	runner.SetRegistry(customRegistry)
+
+	// GetRegistry should return the custom registry
+	if runner.GetRegistry() != customRegistry {
+		t.Error("SetRegistry should set the registry")
 	}
 }

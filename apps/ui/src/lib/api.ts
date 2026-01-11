@@ -1,4 +1,4 @@
-import type { WorkflowRun, ListRunsResponse, GateResult, SearchResponse, IndexRequest, IndexResponse, TrustIndex, PolicyDecision, GatePolicy } from './types';
+import type { WorkflowRun, ListRunsResponse, GateResult, SearchResponse, IndexRequest, IndexResponse, TrustIndex, PolicyDecision, GatePolicy, GateDiffResponse, LatestGateResponse } from './types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8090';
 
@@ -90,5 +90,23 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(policy),
     });
+  },
+
+  // Gate lineage API (v0.8)
+  retryGate(id: string, level: string, name: string, reason?: string): Promise<GateResult> {
+    return fetchJSON<GateResult>(`/runs/${id}/gates/${level}/${name}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: reason || '' }),
+    });
+  },
+
+  getGateDiff(id: string, level: string, name: string, execA: string, execB: string): Promise<GateDiffResponse> {
+    return fetchJSON<GateDiffResponse>(
+      `/runs/${id}/gates/${level}/${name}/diff?exec_a=${encodeURIComponent(execA)}&exec_b=${encodeURIComponent(execB)}`
+    );
+  },
+
+  getLatestGate(id: string, level: string, name: string): Promise<LatestGateResponse> {
+    return fetchJSON<LatestGateResponse>(`/runs/${id}/gates/${level}/${name}/latest`);
   },
 };

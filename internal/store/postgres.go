@@ -87,6 +87,17 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		return fmt.Errorf("failed to execute migration 003: %w", err)
 	}
 
+	// Run migration 004
+	migration004SQL, err := os.ReadFile("infra/migrations/004_gate_lineage.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read migration 004: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, string(migration004SQL))
+	if err != nil {
+		return fmt.Errorf("failed to execute migration 004: %w", err)
+	}
+
 	log.Println("Database migrations applied successfully")
 	return nil
 }
@@ -491,18 +502,13 @@ func (s *PostgresStore) AddGateResult(ctx context.Context, runID string, result 
 		return fmt.Errorf("run not found: %s", runID)
 	}
 
-	// Normalize empty gate name to avoid duplicate issues
-	if result.Name == "" {
-		result.Name = "default"
-	}
+	// Normalize gate name using helper
+	result.Name = contracts.NormalizeGateName(result.Name)
 
 	// Replace existing gate with same level+name, or append if new
 	replaced := false
 	for i, g := range run.Gates {
-		gName := g.Name
-		if gName == "" {
-			gName = "default"
-		}
+		gName := contracts.NormalizeGateName(g.Name)
 		if g.Level == result.Level && gName == result.Name {
 			run.Gates[i] = result
 			replaced = true
@@ -518,15 +524,23 @@ func (s *PostgresStore) AddGateResult(ctx context.Context, runID string, result 
 }
 
 // AddGateResultHistory appends a gate result to the history table.
+// Deprecated: Use AddGateHistoryItem for full lineage support.
 func (s *PostgresStore) AddGateResultHistory(ctx context.Context, runID string, id string, result contracts.GateResult) error {
-	// Normalize empty gate name
-	name := result.Name
-	if name == "" {
-		name = "default"
+	item := contracts.GateHistoryItem{
+		ID:     id,
+		Result: result,
 	}
+	return s.AddGateHistoryItem(ctx, runID, item)
+}
+
+// AddGateHistoryItem appends a gate history item with full lineage support.
+func (s *PostgresStore) AddGateHistoryItem(ctx context.Context, runID string, item contracts.GateHistoryItem) error {
+	// Normalize empty gate name
+	name := contracts.NormalizeGateName(item.Result.Name)
+	item.Result.Name = name
 
 	// Serialize full result to JSON
-	resultJSON, err := json.Marshal(result)
+	resultJSON, err := json.Marshal(item.Result)
 	if err != nil {
 		return fmt.Errorf("failed to marshal gate result: %w", err)
 	}
@@ -535,24 +549,31 @@ func (s *PostgresStore) AddGateResultHistory(ctx context.Context, runID string, 
 		INSERT INTO run_gate_results (
 			id, run_id, level, name, passed, executor,
 			started_at, completed_at, timestamp, duration_ms,
-			evidence_path, error, result
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			evidence_path, error, result, parent_execution_id, retry_reason
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`
 
+	var parentExecID sql.NullString
+	if item.ParentExecutionID != nil && *item.ParentExecutionID != "" {
+		parentExecID = sql.NullString{String: *item.ParentExecutionID, Valid: true}
+	}
+
 	_, err = s.db.ExecContext(ctx, query,
-		id,
+		item.ID,
 		runID,
-		result.Level,
+		item.Result.Level,
 		name,
-		result.Passed,
-		result.Executor,
-		result.StartedAt,
-		result.CompletedAt,
-		result.Timestamp,
-		result.DurationMs,
-		result.EvidencePath,
-		result.Error,
+		item.Result.Passed,
+		item.Result.Executor,
+		item.Result.StartedAt,
+		item.Result.CompletedAt,
+		item.Result.Timestamp,
+		item.Result.DurationMs,
+		item.Result.EvidencePath,
+		item.Result.Error,
 		resultJSON,
+		parentExecID,
+		nullString(item.RetryReason),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert gate history: %w", err)
@@ -568,7 +589,7 @@ func (s *PostgresStore) ListGateHistory(ctx context.Context, runID string, limit
 	}
 
 	query := `
-		SELECT id, result
+		SELECT id, result, parent_execution_id, retry_reason
 		FROM run_gate_results
 		WHERE run_id = $1
 		ORDER BY timestamp DESC
@@ -585,14 +606,23 @@ func (s *PostgresStore) ListGateHistory(ctx context.Context, runID string, limit
 	for rows.Next() {
 		var item contracts.GateHistoryItem
 		var resultJSON []byte
+		var parentExecID, retryReason sql.NullString
 
-		if err := rows.Scan(&item.ID, &resultJSON); err != nil {
+		if err := rows.Scan(&item.ID, &resultJSON, &parentExecID, &retryReason); err != nil {
 			return nil, fmt.Errorf("failed to scan gate history: %w", err)
 		}
 
 		if err := json.Unmarshal(resultJSON, &item.Result); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal gate result: %w", err)
 		}
+
+		// Normalize gate name for backward compatibility
+		item.Result.Name = contracts.NormalizeGateName(item.Result.Name)
+
+		if parentExecID.Valid && parentExecID.String != "" {
+			item.ParentExecutionID = &parentExecID.String
+		}
+		item.RetryReason = retryReason.String
 
 		items = append(items, item)
 	}
@@ -631,6 +661,30 @@ func (s *PostgresStore) GetLatestGates(ctx context.Context, runID string) ([]con
 	}
 
 	return results, rows.Err()
+}
+
+// GetLatestExecution returns the latest execution_id for a specific gate (level+name).
+func (s *PostgresStore) GetLatestExecution(ctx context.Context, runID, level, name string) (string, error) {
+	name = contracts.NormalizeGateName(name)
+
+	query := `
+		SELECT result->>'execution_id'
+		FROM run_gate_results
+		WHERE run_id = $1 AND level = $2 AND name = $3
+		ORDER BY timestamp DESC
+		LIMIT 1
+	`
+
+	var execID sql.NullString
+	err := s.db.QueryRowContext(ctx, query, runID, level, name).Scan(&execID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to query latest execution: %w", err)
+	}
+
+	return execID.String, nil
 }
 
 // AddModelCall appends a model call summary to a run.

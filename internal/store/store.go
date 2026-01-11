@@ -32,10 +32,17 @@ type Store interface {
 	AddGateResult(ctx context.Context, runID string, result contracts.GateResult) error
 
 	// AddGateResultHistory appends a gate result to the history table.
+	// Deprecated: Use AddGateHistoryItem for full lineage support.
 	AddGateResultHistory(ctx context.Context, runID string, id string, result contracts.GateResult) error
+
+	// AddGateHistoryItem appends a gate history item with full lineage support.
+	AddGateHistoryItem(ctx context.Context, runID string, item contracts.GateHistoryItem) error
 
 	// ListGateHistory returns gate history for a run ordered by timestamp desc.
 	ListGateHistory(ctx context.Context, runID string, limit int) ([]contracts.GateHistoryItem, error)
+
+	// GetLatestExecution returns the latest execution_id for a specific gate (level+name).
+	GetLatestExecution(ctx context.Context, runID, level, name string) (string, error)
 
 	// GetLatestGates returns the latest gate result per (level, name).
 	GetLatestGates(ctx context.Context, runID string) ([]contracts.GateResult, error)

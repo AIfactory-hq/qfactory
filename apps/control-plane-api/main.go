@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -146,6 +147,11 @@ func main() {
 	mux.HandleFunc("PATCH /runs/{id}/gate-policy", server.handlePatchGatePolicy)
 	mux.HandleFunc("GET /runs/{id}/gate-policy/decision", server.handleGetPolicyDecision)
 	mux.HandleFunc("GET /runs/{id}/trust", server.handleGetTrustIndex)
+
+	// Gate lineage endpoints (v0.8)
+	mux.HandleFunc("POST /runs/{id}/gates/{level}/{name}/retry", server.handleRetryGate)
+	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/diff", server.handleGateDiff)
+	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/latest", server.handleGetLatestGate)
 
 	addr := ":8090"
 	log.Printf("Control-plane API listening on %s", addr)
@@ -1754,9 +1760,396 @@ func (s *Server) handleGetTrustIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Calculate trust index
+	// Get gate history for enhanced trust calculation
+	history, _ := s.store.ListGateHistory(ctx, id, 100)
+
+	// Calculate trust index with history
 	calculator := gates.NewTrustCalculator()
-	trustIndex := calculator.Calculate(run.GatePolicy, run.Gates)
+	trustIndex := calculator.CalculateWithHistory(run.GatePolicy, run.Gates, history)
 
 	writeJSON(w, http.StatusOK, trustIndex)
+}
+
+// RetryGateRequest is the request body for retrying a gate.
+type RetryGateRequest struct {
+	Reason         string `json:"reason,omitempty"`          // why retry was requested
+	Executor       string `json:"executor,omitempty"`        // "local" or "remote"
+	RunnerURL      string `json:"runner_url,omitempty"`      // required if executor is "remote"
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"` // optional timeout
+}
+
+// handleRetryGate handles POST /runs/{id}/gates/{level}/{name}/retry
+func (s *Server) handleRetryGate(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	level := r.PathValue("level")
+	name := r.PathValue("name")
+
+	if id == "" || level == "" || name == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id, level, or name")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if run is not completed
+	if run.Status != contracts.RunStatusCompleted {
+		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to retry gate (current status: %s)", run.Status))
+		return
+	}
+
+	// Parse request body
+	var req RetryGateRequest
+	if r.Body != nil && r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+
+	// Normalize gate name
+	name = contracts.NormalizeGateName(name)
+
+	// Set up context with timeout
+	timeoutSeconds := 300 // default 5 minutes
+	if req.TimeoutSeconds > 0 {
+		timeoutSeconds = req.TimeoutSeconds
+	}
+	gateCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+
+	// Execute retry using GateRunner
+	result, err := s.gateRunner.RetryGate(gateCtx, id, level, name, req.Reason)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("gate retry failed: %v", err))
+		return
+	}
+
+	// Update evidence files
+	evts, err := s.store.ListEvents(ctx, id, 1000)
+	if err != nil {
+		log.Printf("Warning: failed to list events: %v", err)
+	}
+	if err := s.evidenceSvc.WriteEventsJSONL(id, evts); err != nil {
+		log.Printf("Failed to write events.jsonl: %v", err)
+	}
+
+	// Refresh run and write manifest
+	run, _, err = s.store.GetRun(ctx, id)
+	if err != nil {
+		log.Printf("Warning: failed to refresh run: %v", err)
+	}
+	if run != nil {
+		if err := s.evidenceSvc.WriteManifest(id, run, evts); err != nil {
+			log.Printf("Failed to write manifest: %v", err)
+		}
+	}
+
+	if !result.Passed {
+		writeJSON(w, http.StatusUnprocessableEntity, result)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GateDiffResponse represents the diff between two gate executions.
+type GateDiffResponse struct {
+	RunID      string          `json:"run_id"`
+	Level      string          `json:"level"`
+	Name       string          `json:"name"`
+	ExecA      string          `json:"exec_a"`
+	ExecB      string          `json:"exec_b"`
+	FileDiffs  []FileDiff      `json:"file_diffs"`
+	ResultDiff *GateResultDiff `json:"result_diff,omitempty"`
+}
+
+// FileDiff describes the difference between two files.
+type FileDiff struct {
+	Name     string `json:"name"`
+	SHA256A  string `json:"sha256_a,omitempty"`
+	SHA256B  string `json:"sha256_b,omitempty"`
+	SizeA    int64  `json:"size_a"`
+	SizeB    int64  `json:"size_b"`
+	Modified bool   `json:"modified"`
+}
+
+// GateResultDiff shows differences in gate results.
+type GateResultDiff struct {
+	PassedA    bool  `json:"passed_a"`
+	PassedB    bool  `json:"passed_b"`
+	DurationA  int64 `json:"duration_ms_a"`
+	DurationB  int64 `json:"duration_ms_b"`
+	ChecksPass []int `json:"checks_pass_diff,omitempty"` // indices of checks that changed
+}
+
+// handleGateDiff handles GET /runs/{id}/gates/{level}/{name}/diff
+func (s *Server) handleGateDiff(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	level := r.PathValue("level")
+	name := r.PathValue("name")
+
+	if id == "" || level == "" || name == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id, level, or name")
+		return
+	}
+
+	ctx := r.Context()
+	_, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Get exec_a and exec_b from query params
+	execA := r.URL.Query().Get("exec_a")
+	execB := r.URL.Query().Get("exec_b")
+
+	if execA == "" || execB == "" {
+		writeJSONError(w, http.StatusBadRequest, "exec_a and exec_b query parameters are required")
+		return
+	}
+
+	name = contracts.NormalizeGateName(name)
+
+	// Build evidence paths
+	execADir := filepath.Join(contracts.EvidenceDir, id, "gates", level, name, execA)
+	execBDir := filepath.Join(contracts.EvidenceDir, id, "gates", level, name, execB)
+
+	// Check both directories exist
+	if _, err := os.Stat(execADir); os.IsNotExist(err) {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("execution evidence not found: %s", execA))
+		return
+	}
+	if _, err := os.Stat(execBDir); os.IsNotExist(err) {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("execution evidence not found: %s", execB))
+		return
+	}
+
+	// Compare files
+	fileDiffs, err := compareEvidenceDirs(execADir, execBDir)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to compare evidence: %v", err))
+		return
+	}
+
+	// Compare results
+	resultDiff, err := compareGateResults(execADir, execBDir)
+	if err != nil {
+		log.Printf("Warning: failed to compare gate results: %v", err)
+	}
+
+	resp := GateDiffResponse{
+		RunID:      id,
+		Level:      level,
+		Name:       name,
+		ExecA:      execA,
+		ExecB:      execB,
+		FileDiffs:  fileDiffs,
+		ResultDiff: resultDiff,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// compareEvidenceDirs compares files in two evidence directories.
+func compareEvidenceDirs(dirA, dirB string) ([]FileDiff, error) {
+	filesA := make(map[string]os.FileInfo)
+	filesB := make(map[string]os.FileInfo)
+
+	// Collect files from dirA
+	filepath.Walk(dirA, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		relPath, _ := filepath.Rel(dirA, path)
+		filesA[relPath] = info
+		return nil
+	})
+
+	// Collect files from dirB
+	filepath.Walk(dirB, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		relPath, _ := filepath.Rel(dirB, path)
+		filesB[relPath] = info
+		return nil
+	})
+
+	// Build diff list
+	allFiles := make(map[string]bool)
+	for f := range filesA {
+		allFiles[f] = true
+	}
+	for f := range filesB {
+		allFiles[f] = true
+	}
+
+	var diffs []FileDiff
+	for name := range allFiles {
+		infoA, hasA := filesA[name]
+		infoB, hasB := filesB[name]
+
+		diff := FileDiff{Name: name}
+
+		if hasA {
+			diff.SizeA = infoA.Size()
+			diff.SHA256A = computeFileSHA256(filepath.Join(dirA, name))
+		}
+		if hasB {
+			diff.SizeB = infoB.Size()
+			diff.SHA256B = computeFileSHA256(filepath.Join(dirB, name))
+		}
+
+		diff.Modified = diff.SHA256A != diff.SHA256B
+		diffs = append(diffs, diff)
+	}
+
+	return diffs, nil
+}
+
+// computeFileSHA256 computes the SHA256 hash of a file.
+func computeFileSHA256(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
+
+// compareGateResults compares result.json from two executions.
+func compareGateResults(dirA, dirB string) (*GateResultDiff, error) {
+	resultA, err := loadGateResult(filepath.Join(dirA, "result.json"))
+	if err != nil {
+		return nil, err
+	}
+	resultB, err := loadGateResult(filepath.Join(dirB, "result.json"))
+	if err != nil {
+		return nil, err
+	}
+
+	diff := &GateResultDiff{
+		PassedA:   resultA.Passed,
+		PassedB:   resultB.Passed,
+		DurationA: resultA.DurationMs,
+		DurationB: resultB.DurationMs,
+	}
+
+	// Compare checks
+	minChecks := len(resultA.Checks)
+	if len(resultB.Checks) < minChecks {
+		minChecks = len(resultB.Checks)
+	}
+	for i := 0; i < minChecks; i++ {
+		if resultA.Checks[i].Passed != resultB.Checks[i].Passed {
+			diff.ChecksPass = append(diff.ChecksPass, i)
+		}
+	}
+
+	return diff, nil
+}
+
+// loadGateResult loads a gate result from result.json.
+func loadGateResult(path string) (*contracts.GateResult, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var result contracts.GateResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// LatestGateResponse represents the latest gate execution info.
+type LatestGateResponse struct {
+	RunID       string                `json:"run_id"`
+	Level       string                `json:"level"`
+	Name        string                `json:"name"`
+	ExecutionID string                `json:"execution_id"`
+	Result      *contracts.GateResult `json:"result,omitempty"`
+}
+
+// handleGetLatestGate handles GET /runs/{id}/gates/{level}/{name}/latest
+func (s *Server) handleGetLatestGate(w http.ResponseWriter, r *http.Request) {
+	setCORSHeaders(w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	id := r.PathValue("id")
+	level := r.PathValue("level")
+	name := r.PathValue("name")
+
+	if id == "" || level == "" || name == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id, level, or name")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	name = contracts.NormalizeGateName(name)
+
+	// Get latest execution ID
+	execID, err := s.store.GetLatestExecution(ctx, id, level, name)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("no execution found for gate %s/%s", level, name))
+		return
+	}
+
+	// Find the result in the run's gates
+	var result *contracts.GateResult
+	for _, gate := range run.Gates {
+		if gate.Level == level && contracts.NormalizeGateName(gate.Name) == name {
+			result = &gate
+			break
+		}
+	}
+
+	resp := LatestGateResponse{
+		RunID:       id,
+		Level:       level,
+		Name:        name,
+		ExecutionID: execID,
+		Result:      result,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }

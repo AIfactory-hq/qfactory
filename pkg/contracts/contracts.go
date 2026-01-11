@@ -3,8 +3,31 @@ package contracts
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
+
+// MaxRetryReasonLength is the maximum length for retry reason strings.
+const MaxRetryReasonLength = 256
+
+// NormalizeGateName normalizes a gate name.
+// Empty names become "default", and whitespace is trimmed.
+func NormalizeGateName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "default"
+	}
+	return name
+}
+
+// TruncateRetryReason truncates a retry reason to MaxRetryReasonLength.
+func TruncateRetryReason(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if len(reason) > MaxRetryReasonLength {
+		return reason[:MaxRetryReasonLength]
+	}
+	return reason
+}
 
 // GateLevel constants for quality gates.
 const (
@@ -122,10 +145,12 @@ type Check struct {
 	Message string `json:"message,omitempty"`
 }
 
-// GateHistoryItem wraps a gate result with its history ID.
+// GateHistoryItem wraps a gate result with its history ID and lineage.
 type GateHistoryItem struct {
-	ID     string     `json:"id"`
-	Result GateResult `json:"result"`
+	ID                string     `json:"id"`
+	Result            GateResult `json:"result"`
+	ParentExecutionID *string    `json:"parent_execution_id,omitempty"`
+	RetryReason       string     `json:"retry_reason,omitempty"`
 }
 
 // GateRef references a specific gate by level and name.
@@ -161,10 +186,13 @@ type TrustIndex struct {
 
 // TrustBreakdown provides detail on trust index calculation.
 type TrustBreakdown struct {
-	PassedRequired int `json:"passed_required"`
-	Failed         int `json:"failed"`
-	Stale          int `json:"stale"`
-	Missing        int `json:"missing"`
+	PassedRequired            int `json:"passed_required"`
+	Failed                    int `json:"failed"`
+	Stale                     int `json:"stale"`
+	Missing                   int `json:"missing"`
+	ConsecutiveFailurePenalty int `json:"consecutive_failure_penalty,omitempty"`
+	FlakyPenalty              int `json:"flaky_penalty,omitempty"`
+	RecoveryReward            int `json:"recovery_reward,omitempty"`
 }
 
 // GateEvidence holds raw evidence from a gate execution.

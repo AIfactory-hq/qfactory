@@ -17,6 +17,7 @@ export default function RunDetailPage() {
   const [runningGate, setRunningGate] = useState(false);
   const [runningPR2, setRunningPR2] = useState(false);
   const [runningPR3, setRunningPR3] = useState(false);
+  const [retryingGate, setRetryingGate] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
   const [gateHistory, setGateHistory] = useState<GateHistoryItem[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -134,6 +135,21 @@ export default function RunDetailPage() {
       setError(err instanceof Error ? err.message : 'Failed to run PR3 gate');
     } finally {
       setRunningPR3(false);
+    }
+  }
+
+  async function handleRetryGate(level: string, name: string) {
+    const key = `${level}/${name}`;
+    setRetryingGate(key);
+    try {
+      await api.retryGate(runId, level, name, 'Manual retry from UI');
+      await loadRun();
+      await loadTrustIndex();
+      if (showHistory) await loadHistory();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Failed to retry gate ${key}`);
+    } finally {
+      setRetryingGate(null);
     }
   }
 
@@ -295,23 +311,47 @@ export default function RunDetailPage() {
               <div className="text-3xl font-semibold text-gray-900">{trustIndex.score}</div>
               <div className="text-gray-500 text-sm mt-1">Score (0-100)</div>
             </div>
-            <div className="flex-1 grid grid-cols-4 gap-4 text-center text-sm">
-              <div>
-                <div className="text-xl font-medium text-green-600">{trustIndex.breakdown.passed_required}</div>
-                <div className="text-gray-500">Passed</div>
+            <div className="flex-1">
+              <div className="grid grid-cols-4 gap-4 text-center text-sm">
+                <div>
+                  <div className="text-xl font-medium text-green-600">{trustIndex.breakdown.passed_required}</div>
+                  <div className="text-gray-500">Passed</div>
+                </div>
+                <div>
+                  <div className="text-xl font-medium text-red-600">{trustIndex.breakdown.failed}</div>
+                  <div className="text-gray-500">Failed</div>
+                </div>
+                <div>
+                  <div className="text-xl font-medium text-yellow-600">{trustIndex.breakdown.stale}</div>
+                  <div className="text-gray-500">Stale</div>
+                </div>
+                <div>
+                  <div className="text-xl font-medium text-gray-600">{trustIndex.breakdown.missing}</div>
+                  <div className="text-gray-500">Missing</div>
+                </div>
               </div>
-              <div>
-                <div className="text-xl font-medium text-red-600">{trustIndex.breakdown.failed}</div>
-                <div className="text-gray-500">Failed</div>
-              </div>
-              <div>
-                <div className="text-xl font-medium text-yellow-600">{trustIndex.breakdown.stale}</div>
-                <div className="text-gray-500">Stale</div>
-              </div>
-              <div>
-                <div className="text-xl font-medium text-gray-600">{trustIndex.breakdown.missing}</div>
-                <div className="text-gray-500">Missing</div>
-              </div>
+              {(trustIndex.breakdown.consecutive_failure_penalty || trustIndex.breakdown.flaky_penalty || trustIndex.breakdown.recovery_reward) && (
+                <div className="mt-3 pt-3 border-t border-gray-100 grid grid-cols-3 gap-2 text-center text-xs">
+                  {trustIndex.breakdown.consecutive_failure_penalty ? (
+                    <div>
+                      <div className="text-red-500">-{trustIndex.breakdown.consecutive_failure_penalty}</div>
+                      <div className="text-gray-400">Failures</div>
+                    </div>
+                  ) : <div />}
+                  {trustIndex.breakdown.flaky_penalty ? (
+                    <div>
+                      <div className="text-orange-500">-{trustIndex.breakdown.flaky_penalty}</div>
+                      <div className="text-gray-400">Flaky</div>
+                    </div>
+                  ) : <div />}
+                  {trustIndex.breakdown.recovery_reward ? (
+                    <div>
+                      <div className="text-green-500">+{trustIndex.breakdown.recovery_reward}</div>
+                      <div className="text-gray-400">Recovery</div>
+                    </div>
+                  ) : <div />}
+                </div>
+              )}
             </div>
           </div>
         ) : (
@@ -456,7 +496,7 @@ export default function RunDetailPage() {
             ) : (
               <p className="text-gray-500 text-sm">PR2 gate has not been executed yet.</p>
             )}
-            <div className="mt-4 flex gap-3">
+            <div className="mt-4 flex gap-3 flex-wrap">
               <button
                 onClick={handleRunPR2}
                 disabled={runningPR2 || run?.status !== 'completed'}
@@ -465,6 +505,16 @@ export default function RunDetailPage() {
               >
                 {runningPR2 ? 'Running...' : 'Run PR2 Gate'}
               </button>
+              {pr2Gate && (
+                <button
+                  onClick={() => handleRetryGate('PR2', 'integration_smoke')}
+                  disabled={retryingGate === 'PR2/integration_smoke' || run?.status !== 'completed'}
+                  className="btn btn-secondary"
+                  title="Retry this gate with lineage tracking"
+                >
+                  {retryingGate === 'PR2/integration_smoke' ? 'Retrying...' : 'Retry'}
+                </button>
+              )}
               {pr2Gate?.evidence_path && (
                 <a
                   href={api.getGateEvidenceZipUrl(runId, 'PR2', 'integration_smoke')}
@@ -522,7 +572,7 @@ export default function RunDetailPage() {
             ) : (
               <p className="text-gray-500 text-sm">PR3 gate has not been executed yet.</p>
             )}
-            <div className="mt-4 flex gap-3">
+            <div className="mt-4 flex gap-3 flex-wrap">
               <button
                 onClick={handleRunPR3}
                 disabled={runningPR3 || run?.status !== 'completed'}
@@ -531,6 +581,16 @@ export default function RunDetailPage() {
               >
                 {runningPR3 ? 'Running...' : 'Run PR3 Gate'}
               </button>
+              {pr3Gate && (
+                <button
+                  onClick={() => handleRetryGate('PR3', 'security_scan')}
+                  disabled={retryingGate === 'PR3/security_scan' || run?.status !== 'completed'}
+                  className="btn btn-secondary"
+                  title="Retry this gate with lineage tracking"
+                >
+                  {retryingGate === 'PR3/security_scan' ? 'Retrying...' : 'Retry'}
+                </button>
+              )}
               {pr3Gate?.evidence_path && (
                 <a
                   href={api.getGateEvidenceZipUrl(runId, 'PR3', 'security_scan')}
@@ -585,9 +645,24 @@ export default function RunDetailPage() {
                             exec:{item.result.execution_id.substring(0, 12)}...
                           </span>
                         )}
+                        {item.parent_execution_id && (
+                          <span className="text-xs bg-blue-100 text-blue-800 px-1 rounded">
+                            retry
+                          </span>
+                        )}
                       </div>
+                      {item.retry_reason && (
+                        <div className="text-xs text-blue-600 mb-1">
+                          Reason: {item.retry_reason}
+                        </div>
+                      )}
                       <div className="text-xs text-gray-500">
                         {formatDate(item.result.timestamp)}
+                        {item.parent_execution_id && (
+                          <span className="ml-2 text-gray-400">
+                            ← parent:{item.parent_execution_id.substring(0, 8)}...
+                          </span>
+                        )}
                         {item.result.evidence_path && item.result.execution_id && (
                           <a
                             href={api.getExecEvidenceZipUrl(

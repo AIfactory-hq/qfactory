@@ -56,14 +56,16 @@ type GateInfo struct {
 
 // GatePayload is the payload for gate events.
 type GatePayload struct {
-	Gate         GateInfo `json:"gate"`
-	ExecutionID  string   `json:"execution_id,omitempty"`
-	Passed       bool     `json:"passed,omitempty"`
-	EvidencePath string   `json:"evidence_path,omitempty"`
-	Error        string   `json:"error,omitempty"`
-	StartedAt    string   `json:"started_at,omitempty"`
-	CompletedAt  string   `json:"completed_at,omitempty"`
-	DurationMs   int64    `json:"duration_ms,omitempty"`
+	Gate              GateInfo `json:"gate"`
+	ExecutionID       string   `json:"execution_id,omitempty"`
+	ParentExecutionID string   `json:"parent_execution_id,omitempty"` // v0.8: lineage tracking
+	RetryReason       string   `json:"retry_reason,omitempty"`        // v0.8: why retry was requested
+	Passed            bool     `json:"passed,omitempty"`
+	EvidencePath      string   `json:"evidence_path,omitempty"`
+	Error             string   `json:"error,omitempty"`
+	StartedAt         string   `json:"started_at,omitempty"`
+	CompletedAt       string   `json:"completed_at,omitempty"`
+	DurationMs        int64    `json:"duration_ms,omitempty"`
 }
 
 // NewStageStartedEvent creates a stage.started event.
@@ -169,6 +171,87 @@ func NewGateFailedEvent(runID, level, name, executor, executionID string, errMsg
 		StartedAt:   startedAt.Format(time.RFC3339),
 		CompletedAt: completedAt.Format(time.RFC3339),
 		DurationMs:  durationMs,
+	})
+	return Event{
+		ID:        generateEventID(),
+		Type:      EventTypeGateFailed,
+		RunID:     runID,
+		Timestamp: completedAt,
+		Payload:   payload,
+	}
+}
+
+// GateRetryInfo contains retry lineage information.
+type GateRetryInfo struct {
+	ParentExecutionID string
+	RetryReason       string
+}
+
+// NewGateStartedRetryEvent creates a gate.started event with retry lineage.
+func NewGateStartedRetryEvent(runID, level, name, executor, executionID string, startedAt time.Time, retry GateRetryInfo) Event {
+	payload, _ := json.Marshal(GatePayload{
+		Gate: GateInfo{
+			Level:    level,
+			Name:     name,
+			Executor: executor,
+		},
+		ExecutionID:       executionID,
+		ParentExecutionID: retry.ParentExecutionID,
+		RetryReason:       retry.RetryReason,
+		StartedAt:         startedAt.Format(time.RFC3339),
+	})
+	return Event{
+		ID:        generateEventID(),
+		Type:      EventTypeGateStarted,
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Payload:   payload,
+	}
+}
+
+// NewGateCompletedRetryEvent creates a gate.completed event with retry lineage.
+func NewGateCompletedRetryEvent(runID, level, name, executor, executionID string, passed bool, evidencePath string, startedAt, completedAt time.Time, durationMs int64, retry GateRetryInfo) Event {
+	payload, _ := json.Marshal(GatePayload{
+		Gate: GateInfo{
+			Level:    level,
+			Name:     name,
+			Executor: executor,
+		},
+		ExecutionID:       executionID,
+		ParentExecutionID: retry.ParentExecutionID,
+		RetryReason:       retry.RetryReason,
+		Passed:            passed,
+		EvidencePath:      evidencePath,
+		StartedAt:         startedAt.Format(time.RFC3339),
+		CompletedAt:       completedAt.Format(time.RFC3339),
+		DurationMs:        durationMs,
+	})
+	return Event{
+		ID:        generateEventID(),
+		Type:      EventTypeGateCompleted,
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Payload:   payload,
+	}
+}
+
+// NewGateFailedRetryEvent creates a gate.failed event with retry lineage.
+func NewGateFailedRetryEvent(runID, level, name, executor, executionID string, errMsg string, startedAt time.Time, durationMs int64, retry GateRetryInfo) Event {
+	completedAt := time.Now().UTC()
+	payload, _ := json.Marshal(GatePayload{
+		Gate: GateInfo{
+			Level:    level,
+			Name:     name,
+			Executor: executor,
+		},
+		ExecutionID:       executionID,
+		ParentExecutionID: retry.ParentExecutionID,
+		RetryReason:       retry.RetryReason,
+		Passed:            false,
+		Error:             errMsg,
+		StartedAt:         startedAt.Format(time.RFC3339),
+		CompletedAt:       completedAt.Format(time.RFC3339),
+		DurationMs:        durationMs,
 	})
 	return Event{
 		ID:        generateEventID(),

@@ -30,6 +30,8 @@ export interface GateResult {
 export interface GateHistoryItem {
   id: string;
   result: GateResult;
+  parent_execution_id?: string;
+  retry_reason?: string;
 }
 
 export interface WorkflowRun {
@@ -120,10 +122,49 @@ export interface TrustBreakdown {
   failed: number;
   stale: number;
   missing: number;
+  consecutive_failure_penalty?: number;
+  flaky_penalty?: number;
+  recovery_reward?: number;
 }
 
 export interface TrustIndex {
   score: number;
   grade: string;
   breakdown: TrustBreakdown;
+}
+
+// Gate lineage types (v0.8)
+export interface FileDiff {
+  name: string;
+  sha256_a?: string;
+  sha256_b?: string;
+  size_a: number;
+  size_b: number;
+  modified: boolean;
+}
+
+export interface GateResultDiff {
+  passed_a: boolean;
+  passed_b: boolean;
+  duration_ms_a: number;
+  duration_ms_b: number;
+  checks_pass_diff?: number[];
+}
+
+export interface GateDiffResponse {
+  run_id: string;
+  level: string;
+  name: string;
+  exec_a: string;
+  exec_b: string;
+  file_diffs: FileDiff[];
+  result_diff?: GateResultDiff;
+}
+
+export interface LatestGateResponse {
+  run_id: string;
+  level: string;
+  name: string;
+  execution_id: string;
+  result?: GateResult;
 }

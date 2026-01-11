@@ -6,6 +6,17 @@ import (
 	"time"
 )
 
+// GateLevel constants for quality gates.
+const (
+	GateLevelPR0 = "PR0"
+	GateLevelPR1 = "PR1"
+	GateLevelPR2 = "PR2"
+	GateLevelPR3 = "PR3"
+)
+
+// ValidGateLevels contains all valid gate levels.
+var ValidGateLevels = []string{GateLevelPR0, GateLevelPR1, GateLevelPR2, GateLevelPR3}
+
 // RunStatus represents the status of a workflow run.
 type RunStatus string
 
@@ -63,6 +74,7 @@ type WorkflowRun struct {
 	UpdatedAt    time.Time     `json:"updated_at"`
 	CompletedAt  *time.Time    `json:"completed_at,omitempty"`
 	Error        string        `json:"error,omitempty"`
+	Gates        []GateResult  `json:"gates,omitempty"`
 }
 
 // StageStatus represents the status of a single stage.
@@ -76,10 +88,13 @@ type StageStatus struct {
 
 // GateResult represents the result of a quality gate check.
 type GateResult struct {
-	Level     string    `json:"level"` // PR0, PR1, PR2, PR3
-	Passed    bool      `json:"passed"`
-	Checks    []Check   `json:"checks"`
-	Timestamp time.Time `json:"timestamp"`
+	Level        string    `json:"level"` // PR0, PR1, PR2, PR3
+	Passed       bool      `json:"passed"`
+	Checks       []Check   `json:"checks"`
+	Timestamp    time.Time `json:"timestamp"`
+	DurationMs   int64     `json:"duration_ms"`
+	EvidencePath string    `json:"evidence_path,omitempty"`
+	Error        string    `json:"error,omitempty"`
 }
 
 // Check represents a single check within a gate.
@@ -88,6 +103,23 @@ type Check struct {
 	Passed  bool   `json:"passed"`
 	Message string `json:"message,omitempty"`
 }
+
+// GateEvidence holds raw evidence from a gate execution.
+type GateEvidence struct {
+	Level       string            `json:"level"`
+	Command     string            `json:"command"`
+	StartedAt   time.Time         `json:"started_at"`
+	EndedAt     time.Time         `json:"ended_at"`
+	ExitCode    int               `json:"exit_code"`
+	DurationMs  int64             `json:"duration_ms"`
+	Stdout      string            `json:"stdout"`
+	Stderr      string            `json:"stderr"`
+	GoVersion   string            `json:"go_version,omitempty"`
+	Environment map[string]string `json:"environment,omitempty"`
+}
+
+// EvidenceDir is the base directory for evidence bundles.
+const EvidenceDir = "evidence"
 
 // ArtifactRef references an artifact produced by a workflow.
 type ArtifactRef struct {
@@ -113,4 +145,17 @@ var DemoWorkflowStages = []string{
 	"plan",
 	"implement",
 	"verify",
+}
+
+// EvidenceManifest describes an evidence bundle.
+type EvidenceManifest struct {
+	RunID       string       `json:"run_id"`
+	TemporalID  string       `json:"temporal_id,omitempty"`
+	CreatedAt   time.Time    `json:"created_at"`
+	CompletedAt *time.Time   `json:"completed_at,omitempty"`
+	Status      RunStatus    `json:"status"`
+	Gates       []GateResult `json:"gates,omitempty"`
+	Files       []string     `json:"files"`
+	GeneratedAt time.Time    `json:"generated_at"`
+	Version     string       `json:"version"`
 }

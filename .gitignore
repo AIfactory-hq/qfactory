@@ -67,3 +67,6 @@ evidence/
 secrets/
 *.pem
 *.key
+
+# Evidence bundles (generated)
+evidence/

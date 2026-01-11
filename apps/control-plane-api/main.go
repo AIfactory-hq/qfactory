@@ -2,14 +2,22 @@
 package main
 
 import (
+	"archive/zip"
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -46,6 +54,21 @@ func (s *Store) CreateRun(run *contracts.WorkflowRun) {
 	defer s.mu.Unlock()
 	s.runs[run.ID] = run
 	s.events[run.ID] = []events.Event{}
+}
+
+// ListRuns returns all runs, newest first.
+func (s *Store) ListRuns() []*contracts.WorkflowRun {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	runs := make([]*contracts.WorkflowRun, 0, len(s.runs))
+	for _, run := range s.runs {
+		runs = append(runs, run)
+	}
+	// Sort by created_at descending
+	sort.Slice(runs, func(i, j int) bool {
+		return runs[i].CreatedAt.After(runs[j].CreatedAt)
+	})
+	return runs
 }
 
 // GetRun retrieves a workflow run by ID.
@@ -119,6 +142,18 @@ func (s *Store) updateRunFromEvent(run *contracts.WorkflowRun, event events.Even
 	}
 }
 
+// AddGateResult adds a gate result to a run.
+func (s *Store) AddGateResult(runID string, result contracts.GateResult) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.runs[runID]
+	if !ok {
+		return false
+	}
+	run.Gates = append(run.Gates, result)
+	return true
+}
+
 // GetEvents retrieves all events for a run.
 func (s *Store) GetEvents(runID string) []events.Event {
 	s.mu.RLock()
@@ -166,16 +201,23 @@ func main() {
 	}
 	defer tc.Close()
 
+	evidenceSvc := NewEvidenceService(contracts.EvidenceDir)
+
 	store := NewStore()
 	server := &Server{
-		store:    store,
-		temporal: tc,
+		store:       store,
+		temporal:    tc,
+		evidenceSvc: evidenceSvc,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /workflows", server.handleCreateWorkflow)
+	mux.HandleFunc("GET /runs", server.handleListRuns)
 	mux.HandleFunc("GET /runs/{id}", server.handleGetRun)
 	mux.HandleFunc("GET /runs/{id}/events", server.handleSSE)
+	mux.HandleFunc("POST /runs/{id}/gates/pr1", server.handlePR1Gate)
+	mux.HandleFunc("GET /runs/{id}/evidence", server.handleGetEvidence)
+	mux.HandleFunc("GET /runs/{id}/evidence.zip", server.handleGetEvidenceZip)
 	mux.HandleFunc("POST /internal/events", server.handleInternalEvent)
 
 	addr := ":8090"
@@ -187,8 +229,9 @@ func main() {
 
 // Server holds dependencies for HTTP handlers.
 type Server struct {
-	store    *Store
-	temporal client.Client
+	store       *Store
+	temporal    client.Client
+	evidenceSvc *EvidenceService
 }
 
 // writeJSON writes a JSON response with the given status code.
@@ -270,6 +313,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, run)
 }
 
+func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
+	runs := s.store.ListRuns()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"runs":  runs,
+		"count": len(runs),
+	})
+}
+
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
@@ -335,8 +386,381 @@ func (s *Server) handleInternalEvent(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	run, ok := s.store.GetRun(id)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Get timeout from env, default 60s
+	timeoutSec := 60
+	if envTimeout := os.Getenv("QF_PR1_TIMEOUT_SECONDS"); envTimeout != "" {
+		if t, err := strconv.Atoi(envTimeout); err == nil && t > 0 {
+			timeoutSec = t
+		}
+	}
+
+	// Get Go version
+	goVersionOut, _ := exec.Command("go", "version").Output()
+	goVersion := string(bytes.TrimSpace(goVersionOut))
+
+	// Execute go test ./...
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	startTime := time.Now().UTC()
+	cmd := exec.CommandContext(ctx, "go", "test", "./...")
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	endTime := time.Now().UTC()
+	durationMs := endTime.Sub(startTime).Milliseconds()
+
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else if ctx.Err() == context.DeadlineExceeded {
+			exitCode = -1 // Timeout
+		} else {
+			exitCode = -2 // Other error
+		}
+	}
+
+	passed := exitCode == 0
+
+	// Build evidence
+	evidence := contracts.GateEvidence{
+		Level:      contracts.GateLevelPR1,
+		Command:    "go test ./...",
+		StartedAt:  startTime,
+		EndedAt:    endTime,
+		ExitCode:   exitCode,
+		DurationMs: durationMs,
+		Stdout:     stdout.String(),
+		Stderr:     stderr.String(),
+		GoVersion:  goVersion,
+	}
+
+	// Write evidence to disk
+	evidencePath, writeErr := s.evidenceSvc.WriteGateEvidence(id, contracts.GateLevelPR1, evidence)
+	if writeErr != nil {
+		log.Printf("Failed to write evidence: %v", writeErr)
+	}
+
+	// Write events.jsonl
+	evts := s.store.GetEvents(id)
+	if err := s.evidenceSvc.WriteEventsJSONL(id, evts); err != nil {
+		log.Printf("Failed to write events.jsonl: %v", err)
+	}
+
+	// Build check result
+	checkMsg := "all tests passed"
+	if !passed {
+		if ctx.Err() == context.DeadlineExceeded {
+			checkMsg = fmt.Sprintf("timeout after %ds", timeoutSec)
+		} else {
+			checkMsg = fmt.Sprintf("tests failed with exit code %d", exitCode)
+		}
+	}
+
+	result := contracts.GateResult{
+		Level:        contracts.GateLevelPR1,
+		Passed:       passed,
+		Timestamp:    endTime,
+		DurationMs:   durationMs,
+		EvidencePath: evidencePath,
+		Checks: []contracts.Check{
+			{
+				Name:    "unit_tests",
+				Passed:  passed,
+				Message: checkMsg,
+			},
+		},
+	}
+
+	if !passed && ctx.Err() == context.DeadlineExceeded {
+		result.Error = "timeout exceeded"
+	}
+
+	// Add to run
+	s.store.AddGateResult(id, result)
+
+	// Write manifest
+	if err := s.evidenceSvc.WriteManifest(id, run, s.store.GetEvents(id)); err != nil {
+		log.Printf("Failed to write manifest: %v", err)
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	_, ok := s.store.GetRun(id)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	manifestPath := filepath.Join(contracts.EvidenceDir, id, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSONError(w, http.StatusNotFound, "evidence not found - run PR1 gate first")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "failed to read manifest")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+func (s *Server) handleGetEvidenceZip(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	run, ok := s.store.GetRun(id)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	evidenceDir := filepath.Join(contracts.EvidenceDir, id)
+	if _, err := os.Stat(evidenceDir); os.IsNotExist(err) {
+		writeJSONError(w, http.StatusNotFound, "evidence not found - run PR1 gate first")
+		return
+	}
+
+	zipPath := filepath.Join(contracts.EvidenceDir, id+".zip")
+
+	// Generate zip if not exists or older than evidence dir
+	needsRegen := true
+	if zipInfo, err := os.Stat(zipPath); err == nil {
+		if dirInfo, err := os.Stat(evidenceDir); err == nil {
+			needsRegen = zipInfo.ModTime().Before(dirInfo.ModTime())
+		}
+	}
+
+	if needsRegen {
+		if err := s.evidenceSvc.ZipEvidence(id, run, s.store.GetEvents(id)); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create zip: %v", err))
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.zip\"", id))
+	http.ServeFile(w, r, zipPath)
+}
+
 func generateRunID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+// EvidenceService handles writing evidence bundles to disk.
+type EvidenceService struct {
+	baseDir string
+}
+
+// NewEvidenceService creates a new evidence service.
+func NewEvidenceService(baseDir string) *EvidenceService {
+	return &EvidenceService{baseDir: baseDir}
+}
+
+// WriteGateEvidence writes gate evidence to disk.
+func (e *EvidenceService) WriteGateEvidence(runID, level string, evidence contracts.GateEvidence) (string, error) {
+	gateDir := filepath.Join(e.baseDir, runID, "gates", level)
+	if err := os.MkdirAll(gateDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create gate dir: %w", err)
+	}
+
+	// Write command.txt
+	if err := os.WriteFile(filepath.Join(gateDir, "command.txt"), []byte(evidence.Command+"\n"), 0644); err != nil {
+		return "", fmt.Errorf("failed to write command.txt: %w", err)
+	}
+
+	// Write stdout.log
+	if err := os.WriteFile(filepath.Join(gateDir, "stdout.log"), []byte(evidence.Stdout), 0644); err != nil {
+		return "", fmt.Errorf("failed to write stdout.log: %w", err)
+	}
+
+	// Write stderr.log
+	if err := os.WriteFile(filepath.Join(gateDir, "stderr.log"), []byte(evidence.Stderr), 0644); err != nil {
+		return "", fmt.Errorf("failed to write stderr.log: %w", err)
+	}
+
+	// Write result.json
+	resultJSON, err := json.MarshalIndent(evidence, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal result: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(gateDir, "result.json"), resultJSON, 0644); err != nil {
+		return "", fmt.Errorf("failed to write result.json: %w", err)
+	}
+
+	return gateDir, nil
+}
+
+// WriteEventsJSONL writes all events for a run in JSONL format.
+func (e *EvidenceService) WriteEventsJSONL(runID string, evts []events.Event) error {
+	runDir := filepath.Join(e.baseDir, runID)
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		return fmt.Errorf("failed to create run dir: %w", err)
+	}
+
+	f, err := os.Create(filepath.Join(runDir, "events.jsonl"))
+	if err != nil {
+		return fmt.Errorf("failed to create events.jsonl: %w", err)
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	for _, evt := range evts {
+		line, err := json.Marshal(evt)
+		if err != nil {
+			continue
+		}
+		w.Write(line)
+		w.WriteByte('\n')
+	}
+	return w.Flush()
+}
+
+// WriteManifest writes the evidence manifest.
+func (e *EvidenceService) WriteManifest(runID string, run *contracts.WorkflowRun, evts []events.Event) error {
+	runDir := filepath.Join(e.baseDir, runID)
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		return fmt.Errorf("failed to create run dir: %w", err)
+	}
+
+	// Collect files
+	var files []string
+	filepath.Walk(runDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		relPath, _ := filepath.Rel(runDir, path)
+		files = append(files, relPath)
+		return nil
+	})
+
+	manifest := contracts.EvidenceManifest{
+		RunID:       run.ID,
+		TemporalID:  run.TemporalID,
+		CreatedAt:   run.CreatedAt,
+		CompletedAt: run.CompletedAt,
+		Status:      run.Status,
+		Gates:       run.Gates,
+		Files:       files,
+		GeneratedAt: time.Now().UTC(),
+		Version:     "0.2.0",
+	}
+
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal manifest: %w", err)
+	}
+
+	return os.WriteFile(filepath.Join(runDir, "manifest.json"), data, 0644)
+}
+
+// WriteMetadata writes run metadata.
+func (e *EvidenceService) WriteMetadata(runID string, run *contracts.WorkflowRun) error {
+	runDir := filepath.Join(e.baseDir, runID)
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		return fmt.Errorf("failed to create run dir: %w", err)
+	}
+
+	metadata := map[string]interface{}{
+		"id":           run.ID,
+		"temporal_id":  run.TemporalID,
+		"created_at":   run.CreatedAt,
+		"completed_at": run.CompletedAt,
+		"status":       run.Status,
+	}
+
+	data, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	return os.WriteFile(filepath.Join(runDir, "metadata.json"), data, 0644)
+}
+
+// ZipEvidence creates a zip archive of the evidence bundle.
+func (e *EvidenceService) ZipEvidence(runID string, run *contracts.WorkflowRun, evts []events.Event) error {
+	runDir := filepath.Join(e.baseDir, runID)
+	zipPath := filepath.Join(e.baseDir, runID+".zip")
+
+	// Ensure manifest and metadata are up to date
+	if err := e.WriteManifest(runID, run, evts); err != nil {
+		return err
+	}
+	if err := e.WriteMetadata(runID, run); err != nil {
+		return err
+	}
+
+	zipFile, err := os.Create(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to create zip file: %w", err)
+	}
+	defer zipFile.Close()
+
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
+
+	return filepath.Walk(runDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(runDir, path)
+		if err != nil {
+			return err
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.Join(runID, relPath)
+		header.Method = zip.Deflate
+
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(writer, file)
+		return err
+	})
 }

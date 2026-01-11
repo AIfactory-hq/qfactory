@@ -79,8 +79,16 @@ curl http://localhost:8090/runs/RUN_ID
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | /workflows | Create and start a new workflow run |
+| GET | /runs | List all workflow runs (newest first) |
 | GET | /runs/{id} | Get workflow run status |
 | GET | /runs/{id}/events | SSE stream of run events |
+| POST | /runs/{id}/gates/pr1 | Execute PR1 (unit test) gate |
+| GET | /runs/{id}/evidence | Get evidence manifest |
+| GET | /runs/{id}/evidence.zip | Download evidence bundle |
+
+### PR1 Gate (v0.2)
+
+The PR1 gate runs `go test ./...` with a configurable timeout (default 60s, set via `QF_PR1_TIMEOUT_SECONDS`). Evidence is written to `evidence/<run_id>/` including stdout, stderr, and timing.
 
 ## PR Levels (Quality Gates)
 

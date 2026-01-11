@@ -16,178 +16,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"go.temporal.io/sdk/client"
 
 	"github.com/AIfactory-hq/qfactory/apps/orchestrator-worker/workflow"
 	"github.com/AIfactory-hq/qfactory/internal/modelruntime"
+	"github.com/AIfactory-hq/qfactory/internal/store"
 	"github.com/AIfactory-hq/qfactory/pkg/contracts"
 	"github.com/AIfactory-hq/qfactory/pkg/events"
 )
 
 const TaskQueue = "qfactory-v0"
-
-// Store holds in-memory state for runs and events.
-// TODO: Replace with Postgres in v0.2+
-type Store struct {
-	mu       sync.RWMutex
-	runs     map[string]*contracts.WorkflowRun
-	events   map[string][]events.Event
-	sseChans map[string][]chan events.Event
-}
-
-// NewStore creates a new in-memory store.
-func NewStore() *Store {
-	return &Store{
-		runs:     make(map[string]*contracts.WorkflowRun),
-		events:   make(map[string][]events.Event),
-		sseChans: make(map[string][]chan events.Event),
-	}
-}
-
-// CreateRun stores a new workflow run.
-func (s *Store) CreateRun(run *contracts.WorkflowRun) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.runs[run.ID] = run
-	s.events[run.ID] = []events.Event{}
-}
-
-// ListRuns returns all runs, newest first.
-func (s *Store) ListRuns() []*contracts.WorkflowRun {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	runs := make([]*contracts.WorkflowRun, 0, len(s.runs))
-	for _, run := range s.runs {
-		runs = append(runs, run)
-	}
-	// Sort by created_at descending
-	sort.Slice(runs, func(i, j int) bool {
-		return runs[i].CreatedAt.After(runs[j].CreatedAt)
-	})
-	return runs
-}
-
-// GetRun retrieves a workflow run by ID.
-func (s *Store) GetRun(id string) (*contracts.WorkflowRun, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	run, ok := s.runs[id]
-	return run, ok
-}
-
-// AddEvent stores an event and notifies SSE subscribers.
-func (s *Store) AddEvent(event events.Event) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.events[event.RunID] = append(s.events[event.RunID], event)
-
-	// Update run state based on event
-	if run, ok := s.runs[event.RunID]; ok {
-		s.updateRunFromEvent(run, event)
-	}
-
-	// Notify SSE subscribers
-	for _, ch := range s.sseChans[event.RunID] {
-		select {
-		case ch <- event:
-		default:
-			// Drop if channel is full
-		}
-	}
-}
-
-func (s *Store) updateRunFromEvent(run *contracts.WorkflowRun, event events.Event) {
-	var payload events.StagePayload
-	_ = json.Unmarshal(event.Payload, &payload)
-
-	run.UpdatedAt = event.Timestamp
-
-	switch event.Type {
-	case events.EventTypeStageStarted:
-		run.CurrentStage = payload.StageName
-		if payload.StageIndex < len(run.Stages) {
-			run.Stages[payload.StageIndex].State = contracts.StageStateRunning
-			run.Stages[payload.StageIndex].StartedAt = &event.Timestamp
-		}
-	case events.EventTypeStageCompleted:
-		if payload.StageIndex < len(run.Stages) {
-			run.Stages[payload.StageIndex].State = contracts.StageStateCompleted
-			run.Stages[payload.StageIndex].CompletedAt = &event.Timestamp
-		}
-		// Check if all stages completed
-		allDone := true
-		for _, stage := range run.Stages {
-			if stage.State != contracts.StageStateCompleted {
-				allDone = false
-				break
-			}
-		}
-		if allDone {
-			run.Status = contracts.RunStatusCompleted
-			run.CompletedAt = &event.Timestamp
-			run.CurrentStage = ""
-		}
-	case events.EventTypeStageFailed:
-		if payload.StageIndex < len(run.Stages) {
-			run.Stages[payload.StageIndex].State = contracts.StageStateFailed
-			run.Stages[payload.StageIndex].Error = payload.Error
-		}
-		run.Status = contracts.RunStatusFailed
-		run.Error = payload.Error
-	}
-}
-
-// AddGateResult adds a gate result to a run.
-func (s *Store) AddGateResult(runID string, result contracts.GateResult) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	run, ok := s.runs[runID]
-	if !ok {
-		return false
-	}
-	run.Gates = append(run.Gates, result)
-	return true
-}
-
-// GetEvents retrieves all events for a run.
-func (s *Store) GetEvents(runID string) []events.Event {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	evts := s.events[runID]
-	result := make([]events.Event, len(evts))
-	copy(result, evts)
-	return result
-}
-
-// SubscribeSSE creates a channel for SSE events.
-func (s *Store) SubscribeSSE(runID string) chan events.Event {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ch := make(chan events.Event, 100)
-	s.sseChans[runID] = append(s.sseChans[runID], ch)
-	return ch
-}
-
-// UnsubscribeSSE removes an SSE subscription.
-func (s *Store) UnsubscribeSSE(runID string, ch chan events.Event) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	chans := s.sseChans[runID]
-	for i, c := range chans {
-		if c == ch {
-			s.sseChans[runID] = append(chans[:i], chans[i+1:]...)
-			close(ch)
-			return
-		}
-	}
-}
 
 func main() {
 	temporalAddr := os.Getenv("TEMPORAL_ADDRESS")
@@ -202,6 +44,22 @@ func main() {
 		log.Fatalf("Failed to create Temporal client: %v", err)
 	}
 	defer tc.Close()
+
+	// Initialize PostgreSQL store
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		dbURL = "postgres://qfactory:qfactory@localhost:5432/qfactory?sslmode=disable"
+	}
+
+	ctx := context.Background()
+	pgStore, err := store.NewPostgresStore(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pgStore.Close()
+
+	// SSE hub for real-time notifications
+	sseHub := store.NewSSEHub()
 
 	evidenceSvc := NewEvidenceService(contracts.EvidenceDir)
 
@@ -239,10 +97,11 @@ func main() {
 	}
 
 	budgetMgr := modelruntime.NewBudgetManager()
+	budgetMgr.SetStore(pgStore)
 
-	store := NewStore()
 	server := &Server{
-		store:        store,
+		store:        pgStore,
+		sseHub:       sseHub,
 		temporal:     tc,
 		evidenceSvc:  evidenceSvc,
 		searchSvc:    searchSvc,
@@ -278,7 +137,8 @@ func main() {
 
 // Server holds dependencies for HTTP handlers.
 type Server struct {
-	store        *Store
+	store        store.Store
+	sseHub       *store.SSEHub
 	temporal     client.Client
 	evidenceSvc  *EvidenceService
 	searchSvc    *SearchService
@@ -310,7 +170,11 @@ func (s *Server) handleCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	runID := generateRunID()
+	ctx := r.Context()
+	runID, err := generateRunID()
+	if err != nil {
+		runID = fmt.Sprintf("run-%d", time.Now().UnixNano())
+	}
 	now := time.Now().UTC()
 
 	// Initialize stages
@@ -330,7 +194,10 @@ func (s *Server) handleCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt: now,
 	}
 
-	s.store.CreateRun(run)
+	if err := s.store.CreateRun(ctx, run); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create run: %v", err))
+		return
+	}
 
 	// Start Temporal workflow
 	opts := client.StartWorkflowOptions{
@@ -338,13 +205,19 @@ func (s *Server) handleCreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		TaskQueue: TaskQueue,
 	}
 
-	we, err := s.temporal.ExecuteWorkflow(context.Background(), opts, workflow.DemoWorkflow, runID)
+	we, err := s.temporal.ExecuteWorkflow(ctx, opts, workflow.DemoWorkflow, runID)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to start workflow: %v", err))
 		return
 	}
 
 	run.TemporalID = we.GetID()
+	run.UpdatedAt = time.Now().UTC()
+
+	// Update run with temporal ID
+	if err := s.store.UpdateRun(ctx, run); err != nil {
+		log.Printf("Warning: failed to update run with temporal ID: %v", err)
+	}
 
 	writeJSON(w, http.StatusCreated, run)
 }
@@ -356,7 +229,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, ok := s.store.GetRun(id)
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
@@ -366,7 +244,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
-	runs := s.store.ListRuns()
+	ctx := r.Context()
+	runs, err := s.store.ListRuns(ctx, 100)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list runs: %v", err))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"runs":  runs,
 		"count": len(runs),
@@ -380,7 +263,12 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, ok := s.store.GetRun(id)
+	ctx := r.Context()
+	_, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
@@ -397,17 +285,20 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Replay existing events
-	existingEvents := s.store.GetEvents(id)
+	// Replay existing events from DB
+	existingEvents, err := s.store.ListEvents(ctx, id, 1000)
+	if err != nil {
+		log.Printf("Warning: failed to list events for SSE replay: %v", err)
+	}
 	for _, event := range existingEvents {
 		data, _ := json.Marshal(event)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, data)
 	}
 	flusher.Flush()
 
-	// Subscribe to new events
-	ch := s.store.SubscribeSSE(id)
-	defer s.store.UnsubscribeSSE(id, ch)
+	// Subscribe to new events via in-memory hub
+	ch := s.sseHub.Subscribe(id)
+	defer s.sseHub.Unsubscribe(id, ch)
 
 	for {
 		select {
@@ -433,7 +324,18 @@ func (s *Server) handleInternalEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.store.AddEvent(event)
+	ctx := r.Context()
+
+	// Persist event and update run state in DB
+	if err := s.store.AddEvent(ctx, event); err != nil {
+		log.Printf("Warning: failed to persist event: %v", err)
+	}
+
+	// Notify SSE subscribers
+	s.sseHub.Publish(event.RunID, event)
+
+	// Append to evidence JSONL
+	s.appendEventToEvidence(event)
 
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -445,7 +347,12 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, ok := s.store.GetRun(id)
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
@@ -464,25 +371,25 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 	goVersion := string(bytes.TrimSpace(goVersionOut))
 
 	// Execute go test ./...
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSec)*time.Second)
+	gateCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
 	startTime := time.Now().UTC()
-	cmd := exec.CommandContext(ctx, "go", "test", "./...")
+	cmd := exec.CommandContext(gateCtx, "go", "test", "./...")
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	cmdErr := cmd.Run()
 	endTime := time.Now().UTC()
 	durationMs := endTime.Sub(startTime).Milliseconds()
 
 	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	if cmdErr != nil {
+		if exitErr, ok := cmdErr.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
-		} else if ctx.Err() == context.DeadlineExceeded {
+		} else if gateCtx.Err() == context.DeadlineExceeded {
 			exitCode = -1 // Timeout
 		} else {
 			exitCode = -2 // Other error
@@ -511,7 +418,10 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Write events.jsonl
-	evts := s.store.GetEvents(id)
+	evts, err := s.store.ListEvents(ctx, id, 1000)
+	if err != nil {
+		log.Printf("Warning: failed to list events: %v", err)
+	}
 	if err := s.evidenceSvc.WriteEventsJSONL(id, evts); err != nil {
 		log.Printf("Failed to write events.jsonl: %v", err)
 	}
@@ -519,7 +429,7 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 	// Build check result
 	checkMsg := "all tests passed"
 	if !passed {
-		if ctx.Err() == context.DeadlineExceeded {
+		if gateCtx.Err() == context.DeadlineExceeded {
 			checkMsg = fmt.Sprintf("timeout after %ds", timeoutSec)
 		} else {
 			checkMsg = fmt.Sprintf("tests failed with exit code %d", exitCode)
@@ -541,16 +451,27 @@ func (s *Server) handlePR1Gate(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	if !passed && ctx.Err() == context.DeadlineExceeded {
+	if !passed && gateCtx.Err() == context.DeadlineExceeded {
 		result.Error = "timeout exceeded"
 	}
 
-	// Add to run
-	s.store.AddGateResult(id, result)
+	// Add gate result to DB
+	if err := s.store.AddGateResult(ctx, id, result); err != nil {
+		log.Printf("Warning: failed to add gate result: %v", err)
+	}
+
+	// Refresh run for manifest
+	run, _, err = s.store.GetRun(ctx, id)
+	if err != nil {
+		log.Printf("Warning: failed to refresh run: %v", err)
+	}
 
 	// Write manifest
-	if err := s.evidenceSvc.WriteManifest(id, run, s.store.GetEvents(id)); err != nil {
-		log.Printf("Failed to write manifest: %v", err)
+	if run != nil {
+		evts, _ = s.store.ListEvents(ctx, id, 1000)
+		if err := s.evidenceSvc.WriteManifest(id, run, evts); err != nil {
+			log.Printf("Failed to write manifest: %v", err)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, result)
@@ -563,7 +484,12 @@ func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, ok := s.store.GetRun(id)
+	ctx := r.Context()
+	_, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
@@ -592,7 +518,12 @@ func (s *Server) handleGetEvidenceZip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, ok := s.store.GetRun(id)
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
@@ -615,7 +546,8 @@ func (s *Server) handleGetEvidenceZip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if needsRegen {
-		if err := s.evidenceSvc.ZipEvidence(id, run, s.store.GetEvents(id)); err != nil {
+		evts, _ := s.store.ListEvents(ctx, id, 1000)
+		if err := s.evidenceSvc.ZipEvidence(id, run, evts); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create zip: %v", err))
 			return
 		}
@@ -626,34 +558,20 @@ func (s *Server) handleGetEvidenceZip(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, zipPath)
 }
 
-func generateRunID() string {
+func generateRunID() (string, error) {
 	b := make([]byte, 8)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
-// UpdateRun updates a run in the store (used for budget policy updates).
-func (s *Store) UpdateRun(run *contracts.WorkflowRun) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.runs[run.ID]; !ok {
-		return false
+// appendEventToEvidence writes an event to the evidence JSONL file.
+func (s *Server) appendEventToEvidence(event events.Event) {
+	evts, _ := s.store.ListEvents(context.Background(), event.RunID, 1000)
+	if err := s.evidenceSvc.WriteEventsJSONL(event.RunID, evts); err != nil {
+		log.Printf("Warning: failed to write events.jsonl: %v", err)
 	}
-	s.runs[run.ID] = run
-	return true
-}
-
-// AddModelCall adds a model call summary to a run.
-func (s *Store) AddModelCall(runID string, call contracts.ModelCallSummary) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	run, ok := s.runs[runID]
-	if !ok {
-		return false
-	}
-	run.ModelCalls = append(run.ModelCalls, call)
-	run.UpdatedAt = time.Now().UTC()
-	return true
 }
 
 // truncateString truncates a string to maxLen bytes.
@@ -992,10 +910,10 @@ type ModelCompleteRequest struct {
 
 // ModelCompleteResponse is the response for model completion.
 type ModelCompleteResponse struct {
-	OK       bool                        `json:"ok"`
+	OK       bool                          `json:"ok"`
 	Response *contracts.CompletionResponse `json:"response,omitempty"`
-	Budget   contracts.BudgetDecision    `json:"budget"`
-	Error    string                      `json:"error,omitempty"`
+	Budget   contracts.BudgetDecision      `json:"budget"`
+	Error    string                        `json:"error,omitempty"`
 }
 
 // handleModelComplete handles POST /runs/{id}/model/complete
@@ -1012,7 +930,12 @@ func (s *Server) handleModelComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, ok := s.store.GetRun(id)
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
@@ -1057,17 +980,17 @@ func (s *Server) handleModelComplete(w http.ResponseWriter, r *http.Request) {
 
 	// Set up context with timeout based on budget policy
 	maxLatencyMs := s.budgetMgr.GetMaxLatencyMs(id)
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(maxLatencyMs)*time.Millisecond)
+	modelCtx, cancel := context.WithTimeout(ctx, time.Duration(maxLatencyMs)*time.Millisecond)
 	defer cancel()
 
 	// Call model runtime
-	resp, err := s.modelRuntime.Complete(ctx, completionReq)
+	resp, modelErr := s.modelRuntime.Complete(modelCtx, completionReq)
 
 	// Record model call summary
 	callSummary := contracts.ModelCallSummary{
 		Timestamp: time.Now().UTC(),
 		Stage:     run.CurrentStage,
-		OK:        err == nil,
+		OK:        modelErr == nil,
 	}
 
 	if resp != nil {
@@ -1082,17 +1005,19 @@ func (s *Server) handleModelComplete(w http.ResponseWriter, r *http.Request) {
 		s.budgetMgr.RecordUsage(id, resp.Usage.TotalTokens, resp.LatencyMs)
 	}
 
-	if err != nil {
-		callSummary.Error = err.Error()
+	if modelErr != nil {
+		callSummary.Error = modelErr.Error()
 	}
 
-	// Add model call to run
-	s.store.AddModelCall(id, callSummary)
+	// Add model call to run in DB
+	if addErr := s.store.AddModelCall(ctx, id, callSummary); addErr != nil {
+		log.Printf("Warning: failed to add model call: %v", addErr)
+	}
 
 	// Write evidence
 	errMsg := ""
-	if err != nil {
-		errMsg = err.Error()
+	if modelErr != nil {
+		errMsg = modelErr.Error()
 	}
 	if writeErr := s.evidenceSvc.WriteModelCallEvidence(id, completionReq, resp, errMsg); writeErr != nil {
 		log.Printf("Failed to write model call evidence: %v", writeErr)
@@ -1101,11 +1026,11 @@ func (s *Server) handleModelComplete(w http.ResponseWriter, r *http.Request) {
 	// Get updated budget decision
 	updatedDecision := s.budgetMgr.CheckBudget(id, 0)
 
-	if err != nil {
+	if modelErr != nil {
 		writeJSON(w, http.StatusBadGateway, ModelCompleteResponse{
 			OK:     false,
 			Budget: updatedDecision,
-			Error:  err.Error(),
+			Error:  modelErr.Error(),
 		})
 		return
 	}
@@ -1131,7 +1056,12 @@ func (s *Server) handlePatchBudget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, ok := s.store.GetRun(id)
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
@@ -1164,7 +1094,9 @@ func (s *Server) handlePatchBudget(w http.ResponseWriter, r *http.Request) {
 	// Update run and budget manager
 	run.BudgetPolicy = &policy
 	run.UpdatedAt = time.Now().UTC()
-	s.store.UpdateRun(run)
+	if err := s.store.UpdateRun(ctx, run); err != nil {
+		log.Printf("Warning: failed to update run: %v", err)
+	}
 	s.budgetMgr.SetPolicy(id, &policy)
 
 	writeJSON(w, http.StatusOK, run)

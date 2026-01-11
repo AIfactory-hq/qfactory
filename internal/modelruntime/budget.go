@@ -1,6 +1,7 @@
 package modelruntime
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -11,6 +12,23 @@ import (
 type BudgetManager struct {
 	mu     sync.RWMutex
 	states map[string]*BudgetState
+	store  BudgetStore
+}
+
+// BudgetStore defines persistence operations for budget state.
+type BudgetStore interface {
+	// UpdateBudgetStatus persists budget status for a run.
+	UpdateBudgetStatus(ctx context.Context, runID string, status contracts.BudgetStatus) error
+	// GetBudgetStatus retrieves persisted budget status.
+	GetBudgetStatus(ctx context.Context, runID string) (*contracts.BudgetStatus, error)
+}
+
+// SetStore sets the persistence store for budget state.
+// This allows budget state to survive API restarts.
+func (b *BudgetManager) SetStore(store BudgetStore) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.store = store
 }
 
 // BudgetState tracks budget consumption for a single run.
@@ -34,7 +52,24 @@ func (b *BudgetManager) GetOrCreateState(runID string, policy *contracts.BudgetP
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if state, ok := b.states[runID]; ok {
+	state, ok := b.states[runID]
+	if !ok && b.store != nil {
+		// Try to load from persistent store
+		if status, err := b.store.GetBudgetStatus(context.Background(), runID); err == nil && status != nil {
+			state = &BudgetState{
+				RunID:          runID,
+				Policy:         policy,
+				TokensUsed:     status.TokensUsed,
+				RequestsUsed:   status.RequestsUsed,
+				TotalLatencyMs: int64(status.TimeUsedMs),
+			}
+			if policy == nil {
+				state.Policy = contracts.DefaultBudgetPolicy()
+			}
+			b.states[runID] = state
+		}
+	}
+	if state != nil {
 		// Update policy if provided
 		if policy != nil {
 			state.Policy = policy
@@ -47,7 +82,7 @@ func (b *BudgetManager) GetOrCreateState(runID string, policy *contracts.BudgetP
 		policy = contracts.DefaultBudgetPolicy()
 	}
 
-	state := &BudgetState{
+	state = &BudgetState{
 		RunID:  runID,
 		Policy: policy,
 	}
@@ -146,6 +181,23 @@ func (b *BudgetManager) RecordUsage(runID string, tokens int, latencyMs int64) {
 	state.TokensUsed += tokens
 	state.RequestsUsed++
 	state.TotalLatencyMs += latencyMs
+
+	// Persist to store if available
+	if b.store != nil {
+		status := b.buildBudgetStatus(state)
+		go b.store.UpdateBudgetStatus(context.Background(), runID, status)
+	}
+}
+
+func (b *BudgetManager) buildBudgetStatus(state *BudgetState) contracts.BudgetStatus {
+	return contracts.BudgetStatus{
+		TokensUsed:        state.TokensUsed,
+		TokensRemaining:   state.Policy.MaxTotalTokensPerRun - state.TokensUsed,
+		RequestsUsed:      state.RequestsUsed,
+		RequestsRemaining: state.Policy.MaxTotalRequestsPerRun - state.RequestsUsed,
+		TimeUsedMs:        int(state.TotalLatencyMs),
+		TimeRemainingMs:   state.Policy.MaxLatencyMs - int(state.TotalLatencyMs),
+	}
 }
 
 // GetBudgetStatus returns the current budget status for a run.

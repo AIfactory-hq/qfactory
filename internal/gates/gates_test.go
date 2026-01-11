@@ -14,14 +14,18 @@ import (
 
 // mockStore implements store.Store for testing.
 type mockStore struct {
-	runs  map[string]*contracts.WorkflowRun
-	gates map[string][]contracts.GateResult
+	runs        map[string]*contracts.WorkflowRun
+	gates       map[string][]contracts.GateResult
+	gateHistory map[string][]contracts.GateHistoryItem
+	events      []events.Event
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		runs:  make(map[string]*contracts.WorkflowRun),
-		gates: make(map[string][]contracts.GateResult),
+		runs:        make(map[string]*contracts.WorkflowRun),
+		gates:       make(map[string][]contracts.GateResult),
+		gateHistory: make(map[string][]contracts.GateHistoryItem),
+		events:      []events.Event{},
 	}
 }
 
@@ -77,6 +81,22 @@ func (m *mockStore) AddGateResult(ctx context.Context, runID string, result cont
 	return nil
 }
 
+func (m *mockStore) AddGateResultHistory(ctx context.Context, runID string, id string, result contracts.GateResult) error {
+	m.gateHistory[runID] = append(m.gateHistory[runID], contracts.GateHistoryItem{
+		ID:     id,
+		Result: result,
+	})
+	return nil
+}
+
+func (m *mockStore) ListGateHistory(ctx context.Context, runID string, limit int) ([]contracts.GateHistoryItem, error) {
+	return m.gateHistory[runID], nil
+}
+
+func (m *mockStore) GetLatestGates(ctx context.Context, runID string) ([]contracts.GateResult, error) {
+	return m.gates[runID], nil
+}
+
 func (m *mockStore) AddModelCall(ctx context.Context, runID string, call contracts.ModelCallSummary) error {
 	return nil
 }
@@ -90,6 +110,20 @@ func (m *mockStore) GetBudgetStatus(ctx context.Context, runID string) (*contrac
 }
 
 func (m *mockStore) Close() error {
+	return nil
+}
+
+// mockEventPublisher implements EventPublisher for testing.
+type mockEventPublisher struct {
+	events []events.Event
+}
+
+func newMockEventPublisher() *mockEventPublisher {
+	return &mockEventPublisher{events: []events.Event{}}
+}
+
+func (p *mockEventPublisher) PublishEvent(ctx context.Context, event events.Event) error {
+	p.events = append(p.events, event)
 	return nil
 }
 
@@ -221,5 +255,145 @@ func TestIntegrationSmokeGateMetadata(t *testing.T) {
 	}
 	if gate.Name() != "integration_smoke" {
 		t.Errorf("expected name integration_smoke, got %s", gate.Name())
+	}
+}
+
+func TestGateRunnerHistoryPersistence(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gates_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	store := newMockStore()
+	runner := NewGateRunner(store, tmpDir)
+
+	run := &contracts.WorkflowRun{
+		ID:        "test-run-history",
+		Status:    contracts.RunStatusCompleted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	store.CreateRun(context.Background(), run)
+
+	// Run gate
+	gate := &mockGate{level: "PR2", name: "test_gate", passed: true}
+	_, err = runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("RunGate failed: %v", err)
+	}
+
+	// Verify history was persisted
+	history := store.gateHistory[run.ID]
+	if len(history) != 1 {
+		t.Errorf("expected 1 history item, got %d", len(history))
+	}
+	if history[0].Result.Level != "PR2" {
+		t.Errorf("expected level PR2, got %s", history[0].Result.Level)
+	}
+
+	// Run gate again - should add to history (not replace)
+	_, err = runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("RunGate failed: %v", err)
+	}
+
+	history = store.gateHistory[run.ID]
+	if len(history) != 2 {
+		t.Errorf("expected 2 history items (append-only), got %d", len(history))
+	}
+
+	// But latest view should still have only 1 (replaced)
+	gates := store.gates[run.ID]
+	if len(gates) != 1 {
+		t.Errorf("expected 1 gate in latest view, got %d", len(gates))
+	}
+}
+
+func TestGateRunnerSSEEvents(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gates_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	store := newMockStore()
+	publisher := newMockEventPublisher()
+	runner := NewGateRunner(store, tmpDir)
+	runner.SetEventPublisher(publisher)
+
+	run := &contracts.WorkflowRun{
+		ID:        "test-run-sse",
+		Status:    contracts.RunStatusCompleted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	store.CreateRun(context.Background(), run)
+
+	// Run passing gate
+	gate := &mockGate{level: "PR2", name: "test_gate", passed: true}
+	_, err = runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("RunGate failed: %v", err)
+	}
+
+	// Verify events were emitted
+	if len(publisher.events) != 2 {
+		t.Errorf("expected 2 events (started + completed), got %d", len(publisher.events))
+	}
+
+	if publisher.events[0].Type != events.EventTypeGateStarted {
+		t.Errorf("expected first event gate.started, got %s", publisher.events[0].Type)
+	}
+	if publisher.events[1].Type != events.EventTypeGateCompleted {
+		t.Errorf("expected second event gate.completed, got %s", publisher.events[1].Type)
+	}
+}
+
+func TestSecurityScanGateMetadata(t *testing.T) {
+	gate := NewSecurityScanGate()
+
+	if gate.Level() != contracts.GateLevelPR3 {
+		t.Errorf("expected level PR3, got %s", gate.Level())
+	}
+	if gate.Name() != "security_scan" {
+		t.Errorf("expected name security_scan, got %s", gate.Name())
+	}
+}
+
+func TestGateNameNormalization(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "gates_test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	store := newMockStore()
+	runner := NewGateRunner(store, tmpDir)
+
+	run := &contracts.WorkflowRun{
+		ID:        "test-run-normalize",
+		Status:    contracts.RunStatusCompleted,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	store.CreateRun(context.Background(), run)
+
+	// Run gate with empty name
+	gate := &mockGate{level: "PR1", name: "", passed: true}
+	result, err := runner.RunGate(context.Background(), run.ID, gate)
+	if err != nil {
+		t.Fatalf("RunGate failed: %v", err)
+	}
+
+	// Result should have normalized name
+	if result.Name != "default" {
+		t.Errorf("expected name 'default', got '%s'", result.Name)
+	}
+
+	// History should have normalized name
+	history := store.gateHistory[run.ID]
+	if len(history) > 0 && history[0].Result.Name != "default" {
+		t.Errorf("expected history name 'default', got '%s'", history[0].Result.Name)
 	}
 }

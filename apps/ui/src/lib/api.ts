@@ -36,6 +36,18 @@ export const api = {
     return fetchJSON<GateResult>(`/runs/${id}/gates/pr2`, { method: 'POST' });
   },
 
+  runPR3Gate(id: string): Promise<GateResult> {
+    return fetchJSON<GateResult>(`/runs/${id}/gates/pr3`, { method: 'POST' });
+  },
+
+  getRunWithHistory(id: string): Promise<WorkflowRun> {
+    return fetchJSON<WorkflowRun>(`/runs/${id}?include_history=1`);
+  },
+
+  getGateEvidenceZipUrl(id: string, level: string, name: string): string {
+    return `${API_BASE}/runs/${id}/gates/${level}/${name}/evidence.zip`;
+  },
+
   getEvidenceManifest(id: string): Promise<unknown> {
     return fetchJSON<unknown>(`/runs/${id}/evidence`);
   },

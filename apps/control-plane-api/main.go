@@ -113,6 +113,9 @@ func main() {
 		gateRunner:   gateRunner,
 	}
 
+	// Wire up gate runner with event publisher
+	gateRunner.SetEventPublisher(server)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /workflows", server.handleCreateWorkflow)
 	mux.HandleFunc("GET /runs", server.handleListRuns)
@@ -120,6 +123,9 @@ func main() {
 	mux.HandleFunc("GET /runs/{id}/events", server.handleSSE)
 	mux.HandleFunc("POST /runs/{id}/gates/pr1", server.handlePR1Gate)
 	mux.HandleFunc("POST /runs/{id}/gates/pr2", server.handlePR2Gate)
+	mux.HandleFunc("POST /runs/{id}/gates/pr3", server.handlePR3Gate)
+	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/evidence.zip", server.handleGetGateEvidenceZip)
+	mux.HandleFunc("GET /runs/{id}/gates/{level}/{name}/files", server.handleGetGateFiles)
 	mux.HandleFunc("GET /runs/{id}/evidence", server.handleGetEvidence)
 	mux.HandleFunc("GET /runs/{id}/evidence.zip", server.handleGetEvidenceZip)
 	mux.HandleFunc("POST /internal/events", server.handleInternalEvent)
@@ -162,6 +168,22 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 // writeJSONError writes a JSON error response.
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// PublishEvent implements gates.EventPublisher interface.
+func (s *Server) PublishEvent(ctx context.Context, event events.Event) error {
+	// Persist to DB
+	if err := s.store.AddEvent(ctx, event); err != nil {
+		log.Printf("Warning: failed to persist event: %v", err)
+	}
+
+	// Notify SSE subscribers
+	s.sseHub.Publish(event.RunID, event)
+
+	// Append to evidence JSONL
+	s.appendEventToEvidence(event)
+
+	return nil
 }
 
 func (s *Server) handleCreateWorkflow(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +266,16 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "run not found")
 		return
+	}
+
+	// Optionally include gate history
+	if r.URL.Query().Get("include_history") == "1" {
+		history, err := s.store.ListGateHistory(ctx, id, 100)
+		if err != nil {
+			log.Printf("Warning: failed to get gate history: %v", err)
+		} else {
+			run.GateHistory = history
+		}
 	}
 
 	writeJSON(w, http.StatusOK, run)
@@ -542,6 +574,197 @@ func (s *Server) handlePR2Gate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handlePR3Gate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	ctx := r.Context()
+	run, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	// Reject if run is not completed
+	if run.Status != contracts.RunStatusCompleted {
+		writeJSONError(w, http.StatusUnprocessableEntity, fmt.Sprintf("run must be completed to run PR3 gate (current status: %s)", run.Status))
+		return
+	}
+
+	// Execute PR3 gate
+	gate := gates.NewSecurityScanGate()
+	result, err := s.gateRunner.RunGate(ctx, id, gate)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("gate execution failed: %v", err))
+		return
+	}
+
+	// Update evidence files
+	evts, err := s.store.ListEvents(ctx, id, 1000)
+	if err != nil {
+		log.Printf("Warning: failed to list events: %v", err)
+	}
+	if err := s.evidenceSvc.WriteEventsJSONL(id, evts); err != nil {
+		log.Printf("Failed to write events.jsonl: %v", err)
+	}
+
+	// Refresh run and write manifest
+	run, _, err = s.store.GetRun(ctx, id)
+	if err != nil {
+		log.Printf("Warning: failed to refresh run: %v", err)
+	}
+	if run != nil {
+		if err := s.evidenceSvc.WriteManifest(id, run, evts); err != nil {
+			log.Printf("Failed to write manifest: %v", err)
+		}
+	}
+
+	if !result.Passed {
+		writeJSON(w, http.StatusUnprocessableEntity, result)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleGetGateEvidenceZip(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	level := r.PathValue("level")
+	name := r.PathValue("name")
+
+	if id == "" || level == "" || name == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id, level, or name")
+		return
+	}
+
+	ctx := r.Context()
+	_, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	gateDir := filepath.Join(contracts.EvidenceDir, id, "gates", level, name)
+	if _, err := os.Stat(gateDir); os.IsNotExist(err) {
+		writeJSONError(w, http.StatusNotFound, "gate evidence not found")
+		return
+	}
+
+	// Create zip in memory
+	var buf bytes.Buffer
+	zipWriter := zip.NewWriter(&buf)
+
+	err = filepath.Walk(gateDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(gateDir, path)
+		if err != nil {
+			return err
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.Join(level, name, relPath)
+		header.Method = zip.Deflate
+
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(writer, file)
+		return err
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create zip: %v", err))
+		return
+	}
+
+	if err := zipWriter.Close(); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to finalize zip: %v", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-%s-%s.zip\"", id, level, name))
+	w.Write(buf.Bytes())
+}
+
+func (s *Server) handleGetGateFiles(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	level := r.PathValue("level")
+	name := r.PathValue("name")
+
+	if id == "" || level == "" || name == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing run id, level, or name")
+		return
+	}
+
+	ctx := r.Context()
+	_, ok, err := s.store.GetRun(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get run: %v", err))
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "run not found")
+		return
+	}
+
+	gateDir := filepath.Join(contracts.EvidenceDir, id, "gates", level, name)
+	if _, err := os.Stat(gateDir); os.IsNotExist(err) {
+		writeJSONError(w, http.StatusNotFound, "gate evidence not found")
+		return
+	}
+
+	type fileInfo struct {
+		Name string `json:"name"`
+		Size int64  `json:"size"`
+	}
+
+	var files []fileInfo
+	err = filepath.Walk(gateDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		relPath, _ := filepath.Rel(gateDir, path)
+		files = append(files, fileInfo{Name: relPath, Size: info.Size()})
+		return nil
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to list files: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"run_id": id,
+		"level":  level,
+		"name":   name,
+		"files":  files,
+	})
 }
 
 func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {

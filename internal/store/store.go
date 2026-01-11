@@ -28,8 +28,17 @@ type Store interface {
 	// ListEvents returns events for a run ordered by timestamp, limited to limit rows.
 	ListEvents(ctx context.Context, runID string, limit int) ([]events.Event, error)
 
-	// AddGateResult appends a gate result to a run.
+	// AddGateResult updates the latest view of a gate result (replace by level+name).
 	AddGateResult(ctx context.Context, runID string, result contracts.GateResult) error
+
+	// AddGateResultHistory appends a gate result to the history table.
+	AddGateResultHistory(ctx context.Context, runID string, id string, result contracts.GateResult) error
+
+	// ListGateHistory returns gate history for a run ordered by timestamp desc.
+	ListGateHistory(ctx context.Context, runID string, limit int) ([]contracts.GateHistoryItem, error)
+
+	// GetLatestGates returns the latest gate result per (level, name).
+	GetLatestGates(ctx context.Context, runID string) ([]contracts.GateResult, error)
 
 	// AddModelCall appends a model call summary to a run (bounded, truncates oldest).
 	AddModelCall(ctx context.Context, runID string, call contracts.ModelCallSummary) error

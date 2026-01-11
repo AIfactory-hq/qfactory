@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { api } from '@/lib/api';
-import type { WorkflowRun, SSEEvent, SearchResult } from '@/lib/types';
+import type { WorkflowRun, SSEEvent, SearchResult, GateHistoryItem } from '@/lib/types';
 
 export default function RunDetailPage() {
   const params = useParams();
@@ -16,7 +16,10 @@ export default function RunDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [runningGate, setRunningGate] = useState(false);
   const [runningPR2, setRunningPR2] = useState(false);
+  const [runningPR3, setRunningPR3] = useState(false);
   const [paused, setPaused] = useState(false);
+  const [gateHistory, setGateHistory] = useState<GateHistoryItem[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
   const eventsEndRef = useRef<HTMLDivElement>(null);
 
@@ -54,6 +57,10 @@ export default function RunDetailPage() {
         const data = JSON.parse(event.data);
         setEvents((prev) => [...prev, data]);
         loadRun();
+        // Reload history if visible and gate event received
+        if (showHistory && data.type?.startsWith('gate.')) {
+          loadHistory();
+        }
       } catch {
         // Ignore parse errors
       }
@@ -91,11 +98,41 @@ export default function RunDetailPage() {
     try {
       await api.runPR2Gate(runId);
       await loadRun();
+      if (showHistory) await loadHistory();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to run PR2 gate');
     } finally {
       setRunningPR2(false);
     }
+  }
+
+  async function handleRunPR3() {
+    setRunningPR3(true);
+    try {
+      await api.runPR3Gate(runId);
+      await loadRun();
+      if (showHistory) await loadHistory();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to run PR3 gate');
+    } finally {
+      setRunningPR3(false);
+    }
+  }
+
+  async function loadHistory() {
+    try {
+      const data = await api.getRunWithHistory(runId);
+      setGateHistory(data.gate_history || []);
+    } catch (err) {
+      console.error('Failed to load gate history:', err);
+    }
+  }
+
+  async function toggleHistory() {
+    if (!showHistory) {
+      await loadHistory();
+    }
+    setShowHistory(!showHistory);
   }
 
   async function handleSearch(e: React.FormEvent) {
@@ -146,6 +183,7 @@ export default function RunDetailPage() {
 
   const pr1Gate = run?.gates?.find((g) => g.level === 'PR1');
   const pr2Gate = run?.gates?.find((g) => g.level === 'PR2' && g.name === 'integration_smoke');
+  const pr3Gate = run?.gates?.find((g) => g.level === 'PR3' && g.name === 'security_scan');
 
   if (loading) {
     return (
@@ -338,7 +376,7 @@ export default function RunDetailPage() {
             ) : (
               <p className="text-gray-500 text-sm">PR2 gate has not been executed yet.</p>
             )}
-            <div className="mt-4">
+            <div className="mt-4 flex gap-3">
               <button
                 onClick={handleRunPR2}
                 disabled={runningPR2 || run?.status !== 'completed'}
@@ -347,7 +385,143 @@ export default function RunDetailPage() {
               >
                 {runningPR2 ? 'Running...' : 'Run PR2 Gate'}
               </button>
+              {pr2Gate?.evidence_path && (
+                <a
+                  href={api.getGateEvidenceZipUrl(runId, 'PR2', 'integration_smoke')}
+                  className="btn btn-secondary"
+                  download
+                >
+                  Download Evidence
+                </a>
+              )}
             </div>
+          </div>
+
+          {/* PR3 Gate */}
+          <div className="card">
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">PR3 Gate (Security Scan)</h2>
+            {pr3Gate ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`badge ${pr3Gate.passed ? 'badge-passed' : 'badge-failed'}`}
+                  >
+                    {pr3Gate.passed ? 'Passed' : 'Failed'}
+                  </span>
+                  {pr3Gate.duration_ms && (
+                    <span className="text-sm text-gray-500">
+                      {(pr3Gate.duration_ms / 1000).toFixed(2)}s
+                    </span>
+                  )}
+                  {pr3Gate.executor && (
+                    <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded">
+                      {pr3Gate.executor}
+                    </span>
+                  )}
+                </div>
+                <div className="text-sm text-gray-600">
+                  <div>Timestamp: {formatDate(pr3Gate.timestamp)}</div>
+                  {pr3Gate.evidence_path && (
+                    <div className="mt-1">Evidence: {pr3Gate.evidence_path}</div>
+                  )}
+                </div>
+                {pr3Gate.checks?.map((check, i) => (
+                  <div key={i} className="text-sm pl-2 border-l-2 border-gray-200">
+                    <span className={check.passed ? 'text-green-600' : 'text-red-600'}>
+                      {check.passed ? '✓' : '✗'}
+                    </span>{' '}
+                    {check.name}: {check.message}
+                  </div>
+                ))}
+                {pr3Gate.error && (
+                  <div className="text-sm text-red-600 bg-red-50 p-2 rounded">
+                    {pr3Gate.error}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-gray-500 text-sm">PR3 gate has not been executed yet.</p>
+            )}
+            <div className="mt-4 flex gap-3">
+              <button
+                onClick={handleRunPR3}
+                disabled={runningPR3 || run?.status !== 'completed'}
+                className="btn btn-primary"
+                title={run?.status !== 'completed' ? 'Run must be completed to run PR3 gate' : ''}
+              >
+                {runningPR3 ? 'Running...' : 'Run PR3 Gate'}
+              </button>
+              {pr3Gate?.evidence_path && (
+                <a
+                  href={api.getGateEvidenceZipUrl(runId, 'PR3', 'security_scan')}
+                  className="btn btn-secondary"
+                  download
+                >
+                  Download Evidence
+                </a>
+              )}
+            </div>
+          </div>
+
+          {/* Gate History */}
+          <div className="card">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-gray-900">Gate History</h2>
+              <button
+                onClick={toggleHistory}
+                className="btn btn-secondary text-sm"
+              >
+                {showHistory ? 'Hide History' : 'Show History'}
+              </button>
+            </div>
+            {showHistory && (
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {gateHistory.length === 0 ? (
+                  <p className="text-gray-500 text-sm">No gate executions yet.</p>
+                ) : (
+                  gateHistory.map((item) => (
+                    <div
+                      key={item.id}
+                      className="p-2 bg-gray-50 rounded border border-gray-200 text-sm"
+                    >
+                      <div className="flex items-center gap-2 mb-1">
+                        <span
+                          className={`badge text-xs ${
+                            item.result.passed ? 'badge-passed' : 'badge-failed'
+                          }`}
+                        >
+                          {item.result.passed ? 'Passed' : 'Failed'}
+                        </span>
+                        <span className="font-medium">
+                          {item.result.level}/{item.result.name || 'default'}
+                        </span>
+                        {item.result.duration_ms && (
+                          <span className="text-gray-500">
+                            {(item.result.duration_ms / 1000).toFixed(2)}s
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-gray-500">
+                        {formatDate(item.result.timestamp)}
+                        {item.result.evidence_path && (
+                          <a
+                            href={api.getGateEvidenceZipUrl(
+                              runId,
+                              item.result.level,
+                              item.result.name || 'default'
+                            )}
+                            className="ml-2 text-indigo-600 hover:underline"
+                            download
+                          >
+                            evidence
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
           </div>
 
           {/* Search Panel */}

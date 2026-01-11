@@ -18,6 +18,9 @@ const (
 	EventTypeRunStarted     EventType = "run.started"
 	EventTypeRunCompleted   EventType = "run.completed"
 	EventTypeRunFailed      EventType = "run.failed"
+	EventTypeGateStarted    EventType = "gate.started"
+	EventTypeGateCompleted  EventType = "gate.completed"
+	EventTypeGateFailed     EventType = "gate.failed"
 )
 
 // Event is the envelope for all events.
@@ -42,6 +45,24 @@ type RunPayload struct {
 	Status  string `json:"status"`
 	Message string `json:"message,omitempty"`
 	Error   string `json:"error,omitempty"`
+}
+
+// GateInfo contains gate metadata for events.
+type GateInfo struct {
+	Level    string `json:"level"`
+	Name     string `json:"name"`
+	Executor string `json:"executor"`
+}
+
+// GatePayload is the payload for gate events.
+type GatePayload struct {
+	Gate         GateInfo `json:"gate"`
+	Passed       bool     `json:"passed,omitempty"`
+	EvidencePath string   `json:"evidence_path,omitempty"`
+	Error        string   `json:"error,omitempty"`
+	StartedAt    string   `json:"started_at,omitempty"`
+	CompletedAt  string   `json:"completed_at,omitempty"`
+	DurationMs   int64    `json:"duration_ms,omitempty"`
 }
 
 // NewStageStartedEvent creates a stage.started event.
@@ -81,4 +102,75 @@ func generateEventID() string {
 		return time.Now().UTC().Format("20060102150405.000000000")
 	}
 	return time.Now().UTC().Format("20060102150405") + "-" + hex.EncodeToString(b)
+}
+
+// NewID generates a new unique ID (exported for use by other packages).
+func NewID() string {
+	return generateEventID()
+}
+
+// NewGateStartedEvent creates a gate.started event.
+func NewGateStartedEvent(runID, level, name, executor string, startedAt time.Time) Event {
+	payload, _ := json.Marshal(GatePayload{
+		Gate: GateInfo{
+			Level:    level,
+			Name:     name,
+			Executor: executor,
+		},
+		StartedAt: startedAt.Format(time.RFC3339),
+	})
+	return Event{
+		ID:        generateEventID(),
+		Type:      EventTypeGateStarted,
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Payload:   payload,
+	}
+}
+
+// NewGateCompletedEvent creates a gate.completed event.
+func NewGateCompletedEvent(runID, level, name, executor string, passed bool, evidencePath string, startedAt, completedAt time.Time, durationMs int64) Event {
+	payload, _ := json.Marshal(GatePayload{
+		Gate: GateInfo{
+			Level:    level,
+			Name:     name,
+			Executor: executor,
+		},
+		Passed:       passed,
+		EvidencePath: evidencePath,
+		StartedAt:    startedAt.Format(time.RFC3339),
+		CompletedAt:  completedAt.Format(time.RFC3339),
+		DurationMs:   durationMs,
+	})
+	return Event{
+		ID:        generateEventID(),
+		Type:      EventTypeGateCompleted,
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Payload:   payload,
+	}
+}
+
+// NewGateFailedEvent creates a gate.failed event.
+func NewGateFailedEvent(runID, level, name, executor string, errMsg string, startedAt time.Time, durationMs int64) Event {
+	completedAt := time.Now().UTC()
+	payload, _ := json.Marshal(GatePayload{
+		Gate: GateInfo{
+			Level:    level,
+			Name:     name,
+			Executor: executor,
+		},
+		Passed:      false,
+		Error:       errMsg,
+		StartedAt:   startedAt.Format(time.RFC3339),
+		CompletedAt: completedAt.Format(time.RFC3339),
+		DurationMs:  durationMs,
+	})
+	return Event{
+		ID:        generateEventID(),
+		Type:      EventTypeGateFailed,
+		RunID:     runID,
+		Timestamp: completedAt,
+		Payload:   payload,
+	}
 }

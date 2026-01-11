@@ -26,6 +26,11 @@ export interface GateResult {
   error?: string;
 }
 
+export interface GateHistoryItem {
+  id: string;
+  result: GateResult;
+}
+
 export interface WorkflowRun {
   id: string;
   temporal_id?: string;
@@ -37,6 +42,7 @@ export interface WorkflowRun {
   completed_at?: string;
   error?: string;
   gates?: GateResult[];
+  gate_history?: GateHistoryItem[];
 }
 
 export interface ListRunsResponse {

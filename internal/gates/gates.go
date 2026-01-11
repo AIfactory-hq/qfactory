@@ -11,7 +11,14 @@ import (
 
 	"github.com/AIfactory-hq/qfactory/internal/store"
 	"github.com/AIfactory-hq/qfactory/pkg/contracts"
+	"github.com/AIfactory-hq/qfactory/pkg/events"
 )
+
+// EventPublisher defines the interface for publishing gate events.
+type EventPublisher interface {
+	// PublishEvent persists and broadcasts an event.
+	PublishEvent(ctx context.Context, event events.Event) error
+}
 
 // Gate defines the interface for a quality gate.
 type Gate interface {
@@ -35,6 +42,7 @@ type GateOutput struct {
 type GateRunner struct {
 	store       store.Store
 	evidenceDir string
+	publisher   EventPublisher
 }
 
 // NewGateRunner creates a new gate runner.
@@ -43,6 +51,11 @@ func NewGateRunner(s store.Store, evidenceDir string) *GateRunner {
 		store:       s,
 		evidenceDir: evidenceDir,
 	}
+}
+
+// SetEventPublisher sets the event publisher for SSE notifications.
+func (r *GateRunner) SetEventPublisher(p EventPublisher) {
+	r.publisher = p
 }
 
 // RunGate executes a gate and persists the result.
@@ -55,46 +68,102 @@ func (r *GateRunner) RunGate(ctx context.Context, runID string, gate Gate) (cont
 		return contracts.GateResult{}, fmt.Errorf("run not found: %s", runID)
 	}
 
+	// Normalize gate name in one place
+	gateName := gate.Name()
+	if gateName == "" {
+		gateName = "default"
+	}
+
+	// Generate unique execution ID for history
+	executionID := events.NewID()
+	startTime := time.Now().UTC()
+
+	// Emit gate.started event
+	if r.publisher != nil {
+		startEvent := events.NewGateStartedEvent(runID, gate.Level(), gateName, "local", startTime)
+		if err := r.publisher.PublishEvent(ctx, startEvent); err != nil {
+			fmt.Printf("Warning: failed to publish gate.started event: %v\n", err)
+		}
+	}
+
 	// Execute gate
-	output, err := gate.Run(ctx, run)
-	if err != nil {
+	output, runErr := gate.Run(ctx, run)
+	endTime := time.Now().UTC()
+	durationMs := endTime.Sub(startTime).Milliseconds()
+
+	if runErr != nil {
 		// Gate execution crashed - still write evidence and persist failure
-		now := time.Now().UTC()
 		failOutput := GateOutput{
 			Result: contracts.GateResult{
 				Level:       gate.Level(),
-				Name:        gate.Name(),
+				Name:        gateName,
 				Passed:      false,
 				Executor:    "local",
-				Timestamp:   now,
-				StartedAt:   &now,
-				CompletedAt: &now,
-				DurationMs:  0,
-				Error:       err.Error(),
+				Timestamp:   endTime,
+				StartedAt:   &startTime,
+				CompletedAt: &endTime,
+				DurationMs:  durationMs,
+				Error:       runErr.Error(),
 				Checks: []contracts.Check{
-					{Name: "gate_execution", Passed: false, Message: err.Error()},
+					{Name: "gate_execution", Passed: false, Message: runErr.Error()},
 				},
 			},
 			Command: "",
 			Stdout:  "",
-			Stderr:  err.Error(),
+			Stderr:  runErr.Error(),
 		}
-		evidencePath, _ := r.writeGateEvidence(runID, gate.Level(), gate.Name(), failOutput)
+
+		// Write evidence even on failure
+		evidencePath, _ := r.writeGateEvidence(runID, gate.Level(), gateName, failOutput)
 		failOutput.Result.EvidencePath = evidencePath
+
+		// Persist to history table
+		_ = r.store.AddGateResultHistory(ctx, runID, executionID, failOutput.Result)
+
+		// Update latest view
 		_ = r.store.AddGateResult(ctx, runID, failOutput.Result)
-		return failOutput.Result, fmt.Errorf("gate execution failed: %w", err)
+
+		// Emit gate.failed event
+		if r.publisher != nil {
+			failEvent := events.NewGateFailedEvent(runID, gate.Level(), gateName, "local", runErr.Error(), startTime, durationMs)
+			if err := r.publisher.PublishEvent(ctx, failEvent); err != nil {
+				fmt.Printf("Warning: failed to publish gate.failed event: %v\n", err)
+			}
+		}
+
+		return failOutput.Result, fmt.Errorf("gate execution failed: %w", runErr)
 	}
 
+	// Normalize name in output result
+	output.Result.Name = gateName
+
 	// Write all evidence files
-	evidencePath, writeErr := r.writeGateEvidence(runID, gate.Level(), gate.Name(), output)
+	evidencePath, writeErr := r.writeGateEvidence(runID, gate.Level(), gateName, output)
 	if writeErr != nil {
 		fmt.Printf("Warning: failed to write evidence: %v\n", writeErr)
 	}
 	output.Result.EvidencePath = evidencePath
 
-	// Persist gate result (with replace semantics in store)
+	// Persist to history table
+	if err := r.store.AddGateResultHistory(ctx, runID, executionID, output.Result); err != nil {
+		fmt.Printf("Warning: failed to persist gate history: %v\n", err)
+	}
+
+	// Update latest view (with replace semantics in store)
 	if err := r.store.AddGateResult(ctx, runID, output.Result); err != nil {
 		return output.Result, fmt.Errorf("failed to persist gate result: %w", err)
+	}
+
+	// Emit gate.completed event
+	if r.publisher != nil {
+		completeEvent := events.NewGateCompletedEvent(
+			runID, gate.Level(), gateName, output.Result.Executor,
+			output.Result.Passed, evidencePath,
+			startTime, endTime, output.Result.DurationMs,
+		)
+		if err := r.publisher.PublishEvent(ctx, completeEvent); err != nil {
+			fmt.Printf("Warning: failed to publish gate.completed event: %v\n", err)
+		}
 	}
 
 	return output.Result, nil

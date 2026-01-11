@@ -84,6 +84,7 @@ type WorkflowRun struct {
 	CompletedAt  *time.Time         `json:"completed_at,omitempty"`
 	Error        string             `json:"error,omitempty"`
 	Gates        []GateResult       `json:"gates,omitempty"`
+	GateHistory  []GateHistoryItem  `json:"gate_history,omitempty"`
 	BudgetPolicy *BudgetPolicy      `json:"budget_policy,omitempty"`
 	ModelCalls   []ModelCallSummary `json:"model_calls,omitempty"`
 }
@@ -117,6 +118,12 @@ type Check struct {
 	Name    string `json:"name"`
 	Passed  bool   `json:"passed"`
 	Message string `json:"message,omitempty"`
+}
+
+// GateHistoryItem wraps a gate result with its history ID.
+type GateHistoryItem struct {
+	ID     string     `json:"id"`
+	Result GateResult `json:"result"`
 }
 
 // GateEvidence holds raw evidence from a gate execution.

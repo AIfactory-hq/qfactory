@@ -54,15 +54,26 @@ func NewPostgresStore(ctx context.Context, connStr string) (*PostgresStore, erro
 
 // migrate runs database migrations.
 func (s *PostgresStore) migrate(ctx context.Context) error {
-	// Read migration file
+	// Run migration 001
 	migrationSQL, err := os.ReadFile("infra/migrations/001_initial.sql")
 	if err != nil {
-		return fmt.Errorf("failed to read migration file: %w", err)
+		return fmt.Errorf("failed to read migration 001: %w", err)
 	}
 
 	_, err = s.db.ExecContext(ctx, string(migrationSQL))
 	if err != nil {
-		return fmt.Errorf("failed to execute migration: %w", err)
+		return fmt.Errorf("failed to execute migration 001: %w", err)
+	}
+
+	// Run migration 002
+	migration002SQL, err := os.ReadFile("infra/migrations/002_gate_history.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read migration 002: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, string(migration002SQL))
+	if err != nil {
+		return fmt.Errorf("failed to execute migration 002: %w", err)
 	}
 
 	log.Println("Database migrations applied successfully")
@@ -464,6 +475,122 @@ func (s *PostgresStore) AddGateResult(ctx context.Context, runID string, result 
 
 	run.UpdatedAt = time.Now().UTC()
 	return s.UpdateRun(ctx, run)
+}
+
+// AddGateResultHistory appends a gate result to the history table.
+func (s *PostgresStore) AddGateResultHistory(ctx context.Context, runID string, id string, result contracts.GateResult) error {
+	// Normalize empty gate name
+	name := result.Name
+	if name == "" {
+		name = "default"
+	}
+
+	// Serialize full result to JSON
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("failed to marshal gate result: %w", err)
+	}
+
+	query := `
+		INSERT INTO run_gate_results (
+			id, run_id, level, name, passed, executor,
+			started_at, completed_at, timestamp, duration_ms,
+			evidence_path, error, result
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	`
+
+	_, err = s.db.ExecContext(ctx, query,
+		id,
+		runID,
+		result.Level,
+		name,
+		result.Passed,
+		result.Executor,
+		result.StartedAt,
+		result.CompletedAt,
+		result.Timestamp,
+		result.DurationMs,
+		result.EvidencePath,
+		result.Error,
+		resultJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert gate history: %w", err)
+	}
+
+	return nil
+}
+
+// ListGateHistory returns gate history for a run ordered by timestamp desc.
+func (s *PostgresStore) ListGateHistory(ctx context.Context, runID string, limit int) ([]contracts.GateHistoryItem, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	query := `
+		SELECT id, result
+		FROM run_gate_results
+		WHERE run_id = $1
+		ORDER BY timestamp DESC
+		LIMIT $2
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, runID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query gate history: %w", err)
+	}
+	defer rows.Close()
+
+	var items []contracts.GateHistoryItem
+	for rows.Next() {
+		var item contracts.GateHistoryItem
+		var resultJSON []byte
+
+		if err := rows.Scan(&item.ID, &resultJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan gate history: %w", err)
+		}
+
+		if err := json.Unmarshal(resultJSON, &item.Result); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal gate result: %w", err)
+		}
+
+		items = append(items, item)
+	}
+
+	return items, rows.Err()
+}
+
+// GetLatestGates returns the latest gate result per (level, name).
+func (s *PostgresStore) GetLatestGates(ctx context.Context, runID string) ([]contracts.GateResult, error) {
+	query := `
+		SELECT DISTINCT ON (level, name) result
+		FROM run_gate_results
+		WHERE run_id = $1
+		ORDER BY level, name, timestamp DESC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, runID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest gates: %w", err)
+	}
+	defer rows.Close()
+
+	var results []contracts.GateResult
+	for rows.Next() {
+		var resultJSON []byte
+		if err := rows.Scan(&resultJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan latest gate: %w", err)
+		}
+
+		var result contracts.GateResult
+		if err := json.Unmarshal(resultJSON, &result); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal gate result: %w", err)
+		}
+
+		results = append(results, result)
+	}
+
+	return results, rows.Err()
 }
 
 // AddModelCall appends a model call summary to a run.

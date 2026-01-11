@@ -3,6 +3,7 @@ package store
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/AIfactory-hq/qfactory/pkg/contracts"
@@ -100,6 +101,7 @@ type FinalizeParams struct {
 // SSEHub manages Server-Sent Events subscriptions in-memory.
 // Events are persisted to DB but SSE notifications use this hub.
 type SSEHub struct {
+	mu          sync.RWMutex
 	subscribers map[string][]chan events.Event
 }
 
@@ -112,6 +114,8 @@ func NewSSEHub() *SSEHub {
 
 // Subscribe creates a channel for receiving events for a run.
 func (h *SSEHub) Subscribe(runID string) chan events.Event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	ch := make(chan events.Event, 100)
 	h.subscribers[runID] = append(h.subscribers[runID], ch)
 	return ch
@@ -119,7 +123,11 @@ func (h *SSEHub) Subscribe(runID string) chan events.Event {
 
 // Publish sends an event to all subscribers for a run.
 func (h *SSEHub) Publish(runID string, event events.Event) {
-	for _, ch := range h.subscribers[runID] {
+	h.mu.RLock()
+	chans := h.subscribers[runID]
+	h.mu.RUnlock()
+
+	for _, ch := range chans {
 		select {
 		case ch <- event:
 		default:
@@ -130,6 +138,8 @@ func (h *SSEHub) Publish(runID string, event events.Event) {
 
 // Unsubscribe removes a channel from subscribers.
 func (h *SSEHub) Unsubscribe(runID string, ch chan events.Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	chans := h.subscribers[runID]
 	for i, c := range chans {
 		if c == ch {

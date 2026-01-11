@@ -174,9 +174,27 @@ func main() {
 
 	addr := ":8090"
 	log.Printf("Control-plane API listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	// Wrap with CORS middleware for cross-origin requests
+	handler := corsMiddleware(mux)
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+}
+
+// corsMiddleware wraps a handler with CORS headers for all requests.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Role, X-User-ID, X-Tenant-ID, X-Project-ID")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Server holds dependencies for HTTP handlers.

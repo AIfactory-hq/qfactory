@@ -225,6 +225,36 @@ func writeAPIError(w http.ResponseWriter, httpCode int, code contracts.ErrorCode
 	})
 }
 
+// isValidPathComponent checks if a path component is safe (no path traversal).
+// Returns false if the component contains path separators or traversal sequences.
+func isValidPathComponent(s string) bool {
+	if s == "" {
+		return false
+	}
+	// Check for path traversal attempts
+	if strings.Contains(s, "..") {
+		return false
+	}
+	if strings.Contains(s, "/") || strings.Contains(s, "\\") {
+		return false
+	}
+	// Check for null bytes
+	if strings.Contains(s, "\x00") {
+		return false
+	}
+	return true
+}
+
+// validatePathComponent checks if a path component is safe and writes an error if not.
+// Returns true if the handler should abort (invalid component).
+func validatePathComponent(w http.ResponseWriter, name, value string) bool {
+	if !isValidPathComponent(value) {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid %s: path traversal not allowed", name))
+		return true
+	}
+	return false
+}
+
 // v1.0: RBAC middleware helpers
 
 // extractRequestContext extracts tenant/role info from request headers.
@@ -834,6 +864,11 @@ func (s *Server) handleGetGateEvidenceZip(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Validate path components to prevent path traversal
+	if validatePathComponent(w, "id", id) || validatePathComponent(w, "level", level) || validatePathComponent(w, "name", name) {
+		return
+	}
+
 	ctx := r.Context()
 	_, ok, err := s.store.GetRun(ctx, id)
 	if err != nil {
@@ -911,6 +946,11 @@ func (s *Server) handleGetGateFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate path components to prevent path traversal
+	if validatePathComponent(w, "id", id) || validatePathComponent(w, "level", level) || validatePathComponent(w, "name", name) {
+		return
+	}
+
 	ctx := r.Context()
 	_, ok, err := s.store.GetRun(ctx, id)
 	if err != nil {
@@ -963,6 +1003,12 @@ func (s *Server) handleGetExecEvidenceZip(w http.ResponseWriter, r *http.Request
 
 	if id == "" || level == "" || name == "" || execId == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing run id, level, name, or execution id")
+		return
+	}
+
+	// Validate path components to prevent path traversal
+	if validatePathComponent(w, "id", id) || validatePathComponent(w, "level", level) ||
+		validatePathComponent(w, "name", name) || validatePathComponent(w, "execId", execId) {
 		return
 	}
 
@@ -1045,6 +1091,12 @@ func (s *Server) handleGetExecFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate path components to prevent path traversal
+	if validatePathComponent(w, "id", id) || validatePathComponent(w, "level", level) ||
+		validatePathComponent(w, "name", name) || validatePathComponent(w, "execId", execId) {
+		return
+	}
+
 	ctx := r.Context()
 	_, ok, err := s.store.GetRun(ctx, id)
 	if err != nil {
@@ -1098,6 +1150,11 @@ func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate path component to prevent path traversal
+	if validatePathComponent(w, "id", id) {
+		return
+	}
+
 	ctx := r.Context()
 	_, ok, err := s.store.GetRun(ctx, id)
 	if err != nil {
@@ -1129,6 +1186,11 @@ func (s *Server) handleGetEvidenceZip(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+
+	// Validate path component to prevent path traversal
+	if validatePathComponent(w, "id", id) {
 		return
 	}
 
@@ -1750,6 +1812,11 @@ func (s *Server) handleRunGate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate path components to prevent path traversal
+	if validatePathComponent(w, "id", id) || validatePathComponent(w, "level", level) || validatePathComponent(w, "name", name) {
+		return
+	}
+
 	ctx := r.Context()
 	run, ok, err := s.store.GetRun(ctx, id)
 	if err != nil {
@@ -2018,6 +2085,11 @@ func (s *Server) handleRetryGate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate path components to prevent path traversal
+	if validatePathComponent(w, "id", id) || validatePathComponent(w, "level", level) || validatePathComponent(w, "name", name) {
+		return
+	}
+
 	ctx := r.Context()
 	run, ok, err := s.store.GetRun(ctx, id)
 	if err != nil {
@@ -2181,6 +2253,11 @@ func (s *Server) handleGateDiff(w http.ResponseWriter, r *http.Request) {
 
 	if id == "" || level == "" || name == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing run id, level, or name")
+		return
+	}
+
+	// Validate path components to prevent path traversal
+	if validatePathComponent(w, "id", id) || validatePathComponent(w, "level", level) || validatePathComponent(w, "name", name) {
 		return
 	}
 
@@ -2381,6 +2458,11 @@ func (s *Server) handleGetLatestGate(w http.ResponseWriter, r *http.Request) {
 
 	if id == "" || level == "" || name == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing run id, level, or name")
+		return
+	}
+
+	// Validate path components to prevent path traversal
+	if validatePathComponent(w, "id", id) || validatePathComponent(w, "level", level) || validatePathComponent(w, "name", name) {
 		return
 	}
 
@@ -2626,6 +2708,11 @@ func (s *Server) handleGetCapsule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Validate path component to prevent path traversal
+	if validatePathComponent(w, "id", id) {
+		return
+	}
+
 	ctx := r.Context()
 	run, ok, err := s.store.GetRun(ctx, id)
 	if err != nil {
@@ -2680,6 +2767,9 @@ func (s *Server) handleGetCapsuleZip(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		writeJSONError(w, http.StatusBadRequest, "missing run id")
+		return
+	}
+	if validatePathComponent(w, "id", id) {
 		return
 	}
 
